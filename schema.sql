@@ -6,6 +6,9 @@
 
 -- ── RESET-FRIENDLY ───────────────────────────────────────────────────────────
 
+drop table if exists source_table_cells;
+drop table if exists table_cells;
+drop table if exists tables;
 drop table if exists source_knowledge;
 drop table if exists knowledge_cards;
 -- tags is NOT dropped here — it holds curated catalog data
@@ -23,6 +26,8 @@ create table if not exists projects (
   name            text not null,
   system_prompt   text,
   config          jsonb not null default '{}',
+  tts_locale      text,
+  context_required boolean not null default false,
   user_id         uuid references auth.users(id) on delete cascade,
   created_at      timestamptz not null default now()
 );
@@ -39,24 +44,58 @@ create table if not exists sources (
   id            uuid primary key default gen_random_uuid(),
   project_id    uuid not null references projects(id),
   user_id       uuid references auth.users(id) on delete cascade,
+  context_id    uuid references contexts(id) on delete restrict,  -- nullable; required when contexts_required is true
   original_text text not null,
   created_at    timestamptz not null default now()
 );
 
 create table knowledge_cards (
-  id               uuid primary key default gen_random_uuid(),
-  project_id       uuid references projects(id) on delete cascade,
-  kind             text not null check (kind in ('vocabulary','grammar','expression','table')),
-  name             text not null,
-  details          jsonb,
-  tags             text[],
-  related_card_ids uuid[],
-  skill            int check (skill between 1 and 10),   -- null for table kind
-  importance       int check (importance between 1 and 10),
-  axes             jsonb,  -- table kind: [{name, values}] axis definitions
-  cells            jsonb,  -- table kind: {"key": {"skill": int}} per-cell skill map
-  created_at       timestamptz not null default now(),
+  id                uuid primary key default gen_random_uuid(),
+  project_id        uuid references projects(id) on delete cascade,
+  kind              text not null check (kind in ('vocabulary','grammar','expression')),
+  name              text not null,
+  details           jsonb,
+  tags              text[],
+  related_card_ids  uuid[],
+  related_table_ids uuid[] default '{}',
+  skill             int check (skill between 1 and 10),
+  importance        int check (importance between 1 and 10),
+  created_at        timestamptz not null default now(),
   unique (project_id, name)
+);
+
+create table tables (
+  id           uuid primary key default gen_random_uuid(),
+  project_id   uuid not null references projects(id) on delete cascade,
+  name         text not null,
+  axes         jsonb not null,       -- ["case", "gender", "article_type"] — ordered list of axis names
+  axis_values  jsonb not null,       -- {"case": ["nominative",...], ...} — possible values per axis
+  tags         text[] default '{}',
+  notes        text,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  unique (project_id, name)
+);
+
+create table table_cells (
+  id           uuid primary key default gen_random_uuid(),
+  table_id     uuid not null references tables(id) on delete cascade,
+  cell_key     text not null,   -- canonical: axis names sorted alphabetically, values joined with "-"
+  axis_values  jsonb not null,  -- {"case": "accusative", "gender": "masculine", ...}
+  skill        smallint check (skill between 0 and 10),
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  unique (table_id, cell_key)
+);
+
+-- Source links to specific cells (not the whole table — that's the point of this table)
+create table source_table_cells (
+  id            uuid primary key default gen_random_uuid(),
+  source_id     uuid not null references sources(id) on delete cascade,
+  table_cell_id uuid not null references table_cells(id) on delete cascade,
+  excerpt       text,  -- surface form as it appeared, e.g. "den"
+  note          text,
+  created_at    timestamptz not null default now()
 );
 
 -- Per-user settings: default project selection, etc.
@@ -66,16 +105,13 @@ create table if not exists user_settings (
   updated_at         timestamptz not null default now()
 );
 
-alter table user_settings enable row level security;
-drop policy if exists "anon full access" on user_settings;
-
 -- Tag catalog — curated vocabulary for knowledge_card tags.
 -- knowledge_cards.tags is text[] (denormalized); this table is the canonical spelling source.
 -- name: full identifier stored in knowledge_cards.tags (e.g. "verb-irregular-present")
 -- display_name: short label shown in the UI (e.g. "irr-present")
 create table if not exists tags (
   id           uuid primary key default gen_random_uuid(),
-  project_id   uuid references projects(id) on delete cascade,
+  project_id   uuid not null references projects(id) on delete cascade,
   name         text not null,
   display_name text,
   description  text,
@@ -84,23 +120,28 @@ create table if not exists tags (
 );
 
 create table source_knowledge (
-  source_id        uuid not null references sources(id),
+  source_id         uuid not null references sources(id),
   knowledge_card_id uuid not null references knowledge_cards(id),
-  excerpt          text,
-  note             text,
-  created_at       timestamptz not null default now(),
+  positions         jsonb not null,  -- [{start, end}] absolute char offsets into sources.original_text
+  note              text,
+  created_at        timestamptz not null default now(),
   primary key (source_id, knowledge_card_id)
 );
 
 
 -- ── RLS ───────────────────────────────────────────────────────────────────────
 
-alter table projects         enable row level security;
-alter table sources          enable row level security;
-alter table knowledge_cards  enable row level security;
-alter table source_knowledge enable row level security;
-alter table contexts         enable row level security;
-alter table tags             enable row level security;
+alter table projects               enable row level security;
+alter table sources                enable row level security;
+alter table knowledge_cards        enable row level security;
+alter table source_knowledge       enable row level security;
+alter table contexts               enable row level security;
+alter table tags                   enable row level security;
+alter table user_settings          enable row level security;
+alter table tables                 enable row level security;
+alter table table_cells            enable row level security;
+alter table source_table_cells     enable row level security;
+-- system_prompt_history RLS is enabled after the table is created below
 
 -- Remove old open-access policies
 drop policy if exists "anon full access" on projects;
@@ -109,6 +150,11 @@ drop policy if exists "anon full access" on knowledge_cards;
 drop policy if exists "anon full access" on source_knowledge;
 drop policy if exists "anon full access" on contexts;
 drop policy if exists "anon full access" on tags;
+drop policy if exists "anon full access" on user_settings;
+drop policy if exists "anon full access" on tables;
+drop policy if exists "anon full access" on table_cells;
+drop policy if exists "anon full access" on source_table_cells;
+-- system_prompt_history drop policy is applied after the table is created below
 
 -- All data access goes through /api/* serverless functions using the service role key,
 -- which bypasses RLS. No direct browser access to the DB is permitted.
@@ -117,11 +163,9 @@ drop policy if exists "anon full access" on tags;
 
 -- ── TAG CATALOG SEED ─────────────────────────────────────────────────────────
 -- Safe to re-run; ON CONFLICT DO NOTHING is idempotent.
--- NOTE: After adding project_id to tags, seed tags are per-project.
--- Run this after inserting your project row, substituting the real project uuid.
--- Example:
---   insert into tags (project_id, name, display_name) values ('<project-uuid>', 'noun', 'noun') on conflict (project_id, name) do update set display_name = excluded.display_name;
--- The seed block below is intentionally left without project_id — run it manually per project.
+-- Tags are project-scoped. Run manually per project, substituting the real project uuid:
+--   insert into tags (project_id, name, display_name) values ('<project-uuid>', 'noun', 'noun')
+--   on conflict (project_id, name) do update set display_name = excluded.display_name;
 
 
 -- ── SYSTEM PROMPT HISTORY ────────────────────────────────────────────────────
@@ -135,52 +179,27 @@ create table if not exists system_prompt_history (
 
 create index if not exists idx_system_prompt_history_project_id on system_prompt_history(project_id);
 
--- ── CHANGES TO SACRED TABLES ─────────────────────────────────────────────────
--- Additive changes: new columns with defaults or nullable.
--- Destructive changes: only with explicit confirmation (data is gone forever).
-
--- Rename settings → config (idempotent via DO block)
-do $$
-begin
-  if exists (
-    select 1 from information_schema.columns
-    where table_name = 'projects' and column_name = 'settings'
-  ) then
-    alter table projects rename column settings to config;
-  end if;
-end $$;
-
-alter table projects add column if not exists config   jsonb not null default '{}';
-alter table projects add column if not exists user_id  uuid references auth.users(id) on delete cascade;
-
-alter table sources  add column if not exists user_id  uuid references auth.users(id) on delete cascade;
-alter table sources  add column if not exists context_id uuid references contexts(id) on delete restrict;
--- context_id is nullable: required when project.config.contexts_required is true, optional otherwise.
-alter table sources  alter column context_id drop not null;
-alter table sources  drop column if exists context;
-
-alter table tags add column if not exists project_id uuid references projects(id) on delete cascade;
-alter table tags add column if not exists display_name text;
-
--- Drop old unique constraint on name alone and add per-project uniqueness
-alter table tags drop constraint if exists tags_name_key;
-do $$
-begin
-  if not exists (
-    select 1 from pg_constraint where conname = 'tags_project_id_name_key'
-  ) then
-    alter table tags add constraint tags_project_id_name_key unique (project_id, name);
-  end if;
-end $$;
+alter table system_prompt_history  enable row level security;
+drop policy if exists "anon full access" on system_prompt_history;
 
 -- ── INDEXES ───────────────────────────────────────────────────────────────────
 
-create index if not exists idx_projects_user_id          on projects(user_id);
-create index if not exists idx_sources_user_id           on sources(user_id);
-create index if not exists idx_sources_project_id        on sources(project_id);
+create index if not exists idx_projects_user_id           on projects(user_id);
+create index if not exists idx_sources_user_id            on sources(user_id);
+create index if not exists idx_sources_project_id         on sources(project_id);
 create index if not exists idx_knowledge_cards_project_id on knowledge_cards(project_id);
-create index if not exists idx_tags_project_id           on tags(project_id);
-create index if not exists idx_contexts_project_id       on contexts(project_id);
+create index if not exists idx_tags_project_id            on tags(project_id);
+create index if not exists idx_contexts_project_id        on contexts(project_id);
+create index if not exists idx_tables_project_id          on tables(project_id);
+create index if not exists idx_table_cells_table          on table_cells(table_id);
+create index if not exists idx_stc_source                 on source_table_cells(source_id);
+create index if not exists idx_stc_cell                   on source_table_cells(table_cell_id);
+
+-- ── RETROACTIVE COLUMN ADDITIONS ─────────────────────────────────────────────
+-- Safe to re-run on existing databases.
+
+alter table projects add column if not exists tts_locale      text;
+alter table projects add column if not exists context_required boolean not null default false;
 
 
 -- ── FUNCTIONS ─────────────────────────────────────────────────────────────────
@@ -196,16 +215,16 @@ create or replace function save_card_and_link(
 declare
   new_card knowledge_cards;
 begin
-  insert into knowledge_cards (kind, name, details, tags, related_card_ids, skill, importance, axes, cells, project_id)
-  select kind, name, details, tags, related_card_ids, skill, importance, axes, cells, project_id
+  insert into knowledge_cards (kind, name, details, tags, related_card_ids, related_table_ids, skill, importance, project_id)
+  select kind, name, details, tags, related_card_ids, related_table_ids, skill, importance, project_id
   from jsonb_populate_record(null::knowledge_cards, card)
   returning * into new_card;
 
-  insert into source_knowledge (source_id, knowledge_card_id, excerpt, note)
+  insert into source_knowledge (source_id, knowledge_card_id, positions, note)
   values (
     (link->>'source_id')::uuid,
     new_card.id,
-    link->>'excerpt',
+    (link->'positions'),
     link->>'note'
   );
 

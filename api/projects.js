@@ -16,7 +16,7 @@ export default async function handler(req, res) {
     const [{ data: projects, error }, { data: settings }] = await Promise.all([
       supabase
         .from('projects')
-        .select('id, name, config, system_prompt')
+        .select('id, name, config, system_prompt, tts_locale, context_required')
         .eq('user_id', user.id)
         .order('created_at'),
       supabase
@@ -34,7 +34,7 @@ export default async function handler(req, res) {
   }
 
   if (req.method === 'POST') {
-    const { name, config } = req.body ?? {}
+    const { name, config, tts_locale, context_required } = req.body ?? {}
     if (!name?.trim()) return res.status(400).json({ error: 'name required' })
 
     const { data: project, error } = await supabase
@@ -44,8 +44,10 @@ export default async function handler(req, res) {
         config: config ?? {},
         user_id: user.id,
         system_prompt: PLACEHOLDER_PROMPT,
+        tts_locale: tts_locale ?? null,
+        context_required: context_required ?? null,
       })
-      .select('id, name, config, system_prompt')
+      .select('id, name, config, system_prompt, tts_locale, context_required')
       .single()
 
     if (error) return res.status(500).json({ error: error.message })
@@ -63,7 +65,7 @@ export default async function handler(req, res) {
       throw e
     }
 
-    const { system_prompt, config } = req.body ?? {}
+    const { system_prompt, config, tts_locale, context_required } = req.body ?? {}
     const updates = {}
 
     if (system_prompt !== undefined || config !== undefined) {
@@ -87,6 +89,9 @@ export default async function handler(req, res) {
       }
     }
 
+    if (tts_locale !== undefined) updates.tts_locale = tts_locale
+    if (context_required !== undefined) updates.context_required = context_required
+
     if (Object.keys(updates).length === 0) {
       return res.status(400).json({ error: 'Nothing to update' })
     }
@@ -95,7 +100,7 @@ export default async function handler(req, res) {
       .from('projects')
       .update(updates)
       .eq('id', id)
-      .select('id, name, config, system_prompt')
+      .select('id, name, config, system_prompt, tts_locale, context_required')
       .single()
 
     if (error) return res.status(500).json({ error: error.message })

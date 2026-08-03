@@ -6,7 +6,7 @@ A personal multi-user language learning assistant. Chat with Claude to learn voc
 
 React frontend → Vercel serverless functions → Anthropic (Claude) + Supabase
 
-Claude streams responses inline, emitting fenced JSON blocks for vocabulary and grammar cards. You review and save them to the database with one click. Claude checks for duplicates before emitting any card. All API routes require a Supabase Auth session — accounts are created manually in the Supabase dashboard.
+The UI is a multi-panel workspace with a narrow sidebar on the left (Chat, Sources, Cards, Tags, Contexts). Panels open side by side and can be resized by dragging the handles between them. Claude streams responses inline, emitting fenced JSON blocks for vocabulary and grammar cards. You review and save them to the database with one click. Claude checks for duplicates before emitting any card. All API routes require a Supabase Auth session — accounts are created manually in the Supabase dashboard.
 
 ## Running locally
 
@@ -60,8 +60,13 @@ After migrating, create your user account in the Supabase dashboard under **Auth
 ## Project structure
 
 ```
-src/          React frontend (auth, project context, chat UI)
-api/          Vercel serverless functions (all require auth)
-lib/          Server-side helpers (auth, Supabase admin client, project config)
-schema.sql    Database schema (source of truth)
+src/                  React frontend
+  components/
+    panels/           Chat, Sources, SourceDetail, Contexts, Cards, Tags panels
+    Sidebar.jsx       Left icon rail — toggles panels open/closed
+    ResizeHandle.jsx  Drag handle between panels
+  App.jsx             Layout orchestrator (openPanels, panelWidths)
+api/                  Vercel serverless functions (all require auth)
+lib/                  Server-side helpers (auth, Supabase admin client, project config)
+schema.sql            Database schema (source of truth)
 ```

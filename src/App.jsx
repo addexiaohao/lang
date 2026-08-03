@@ -1,65 +1,45 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
-import ChatMessage from './components/ChatMessage.jsx'
-import { ProjectSwitcher } from './components/ProjectSwitcher.jsx'
 import { useProject } from './ProjectContext.jsx'
 import { apiFetch } from './apiFetch.js'
 import { supabase } from './supabaseClient.js'
+import { Sidebar } from './components/Sidebar.jsx'
+import { ResizeHandle } from './components/ResizeHandle.jsx'
+import { ProjectSwitcher } from './components/ProjectSwitcher.jsx'
+import { ChatPanel } from './components/panels/ChatPanel.jsx'
+import { SourcesPanel } from './components/panels/SourcesPanel.jsx'
+import { SourceDetailPanel } from './components/panels/SourceDetailPanel.jsx'
+import { ContextsPanel } from './components/panels/ContextsPanel.jsx'
+import { TagsPanel } from './components/panels/TagsPanel.jsx'
+import { CardsPanel } from './components/panels/CardsPanel.jsx'
+import { CardDetailPanel } from './components/panels/CardDetailPanel.jsx'
 
-function NewContextForm({ projectId, onCreated }) {
-  const [name, setName] = useState('')
-  const [saving, setSaving] = useState(false)
-
-  async function handleCreate(e) {
-    e.preventDefault()
-    if (!name.trim()) return
-    setSaving(true)
-    try {
-      const res = await apiFetch('/api/contexts', {
-        method: 'POST',
-        body: JSON.stringify({ project_id: projectId, name: name.trim() }),
-      })
-      const data = await res.json()
-      if (res.ok) {
-        onCreated(data)
-        setName('')
-      }
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  return (
-    <form onSubmit={handleCreate} className="flex items-center gap-1">
-      <input
-        className="text-xs border border-gray-300 rounded px-2 py-1 w-36 focus:outline-none focus:ring-1 focus:ring-blue-400"
-        placeholder="New context…"
-        value={name}
-        onChange={e => setName(e.target.value)}
-      />
-      <button
-        type="submit"
-        disabled={saving || !name.trim()}
-        className="text-xs px-2 py-1 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-40 transition-colors"
-      >
-        {saving ? '…' : 'Add'}
-      </button>
-    </form>
-  )
+const DEFAULT_WIDTHS = {
+  chat: 560,
+  sources: 300,
+  'source-detail': 360,
+  cards: 340,
+  'card-detail': 360,
+  tags: 340,
+  contexts: 340,
 }
+const MIN_WIDTH = 100
 
 export default function App() {
   const { activeProject, loading: projectsLoading } = useProject()
-  const [messages, setMessages] = useState([])
-  const [input, setInput] = useState('')
-  const [isStreaming, setIsStreaming] = useState(false)
-  // sourceRefMap: { [ref]: { id?: string, text?: string } } — conversation-wide source tracking
-  const [sourceRefMap, setSourceRefMap] = useState({})
   const [contexts, setContexts] = useState([])
   const [tagCatalog, setTagCatalog] = useState([])
-  const [showNewContext, setShowNewContext] = useState(false)
-  const bottomRef = useRef(null)
   const navigate = useNavigate()
+
+  const [openPanels, setOpenPanels] = useState(['chat'])
+  const [panelWidths, setPanelWidths] = useState({ chat: DEFAULT_WIDTHS.chat })
+  const [selectedSource, setSelectedSource] = useState(null)
+  const [selectedCard, setSelectedCard] = useState(null)
+  const [chatInput, setChatInput] = useState('')
+  const [draggingIndex, setDraggingIndex] = useState(null)
+  const [dragOverIndex, setDragOverIndex] = useState(null)
+  const dragRef = useRef({ from: null, to: null })
+  const panelContainerRef = useRef(null)
 
   useEffect(() => {
     if (!activeProject) return
@@ -67,167 +47,299 @@ export default function App() {
       .then(r => r.ok ? r.json() : [])
       .then(setContexts)
       .catch(() => {})
-    apiFetch(`/api/tags?project_id=${activeProject.id}`)
+    apiFetch(`/api/tags?project_id=${activeProject.id}&limit=300`)
       .then(r => r.ok ? r.json() : [])
       .then(setTagCatalog)
       .catch(() => {})
-    // Reset conversation when switching projects
-    setMessages([])
-    setSourceRefMap({})
   }, [activeProject?.id])
 
-  const handleSourceRegistered = useCallback((ref, text) => {
-    setSourceRefMap(prev => ({ ...prev, [ref]: { ...(prev[ref] ?? {}), text } }))
-  }, [])
-
-  const handleSourceSaved = useCallback((ref, id) => {
-    if (ref != null) setSourceRefMap(prev => ({ ...prev, [ref]: { ...(prev[ref] ?? {}), id } }))
-  }, [])
-
-  function refreshTagCatalog() {
+  const refreshTagCatalog = useCallback(() => {
     if (!activeProject) return
-    apiFetch(`/api/tags?project_id=${activeProject.id}`)
+    apiFetch(`/api/tags?project_id=${activeProject.id}&limit=300`)
       .then(r => r.ok ? r.json() : [])
       .then(setTagCatalog)
       .catch(() => {})
-  }
-
-  function handleContextCreated(context) {
-    setContexts(prev => [...prev, context])
-    setShowNewContext(false)
-  }
+  }, [activeProject?.id])
 
   async function handleLogout() {
     await supabase.auth.signOut()
     navigate('/login')
   }
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  function togglePanel(id) {
+    setOpenPanels(prev => {
+      if (prev.includes(id)) {
+        if (id === 'sources') {
+          setSelectedSource(null)
+          return prev.filter(p => p !== id && p !== 'source-detail')
+        }
+        if (id === 'cards') {
+          setSelectedCard(null)
+          return prev.filter(p => p !== id && p !== 'card-detail')
+        }
+        return prev.filter(p => p !== id)
+      }
+      setPanelWidths(w => ({ ...w, [id]: DEFAULT_WIDTHS[id] ?? 360 }))
+      return [...prev, id]
+    })
+  }
 
-  async function sendMessage(e) {
+  function handleSelectCard(card) {
+    setSelectedCard(card)
+    setOpenPanels(prev => {
+      if (!prev.includes('card-detail')) {
+        setPanelWidths(w => ({ ...w, 'card-detail': DEFAULT_WIDTHS['card-detail'] }))
+        return [...prev, 'card-detail']
+      }
+      return prev
+    })
+  }
+
+  function handleCloseCardDetail() {
+    setSelectedCard(null)
+    setOpenPanels(prev => prev.filter(p => p !== 'card-detail'))
+  }
+
+  function handleSelectSource(source) {
+    setSelectedSource(source)
+    setOpenPanels(prev => {
+      if (!prev.includes('source-detail')) {
+        setPanelWidths(w => ({ ...w, 'source-detail': DEFAULT_WIDTHS['source-detail'] }))
+        return [...prev, 'source-detail']
+      }
+      return prev
+    })
+  }
+
+  function handleCloseSourceDetail() {
+    setSelectedSource(null)
+    setOpenPanels(prev => prev.filter(p => p !== 'source-detail'))
+  }
+
+  function handleAppendToChat(text) {
+    setOpenPanels(prev => {
+      if (prev.includes('chat')) return prev
+      setPanelWidths(w => ({ ...w, chat: DEFAULT_WIDTHS.chat }))
+      return ['chat', ...prev]
+    })
+    setChatInput(prev => prev ? prev + '\n' + text : text)
+  }
+
+  function handlePanelDragStart(index, e) {
     e.preventDefault()
-    const text = input.trim()
-    if (!text || isStreaming || !activeProject) return
+    setDraggingIndex(index)
+    setDragOverIndex(index)
+    dragRef.current = { from: index, to: index }
 
-    const userMessage = { role: 'user', content: text }
-    const nextMessages = [...messages, userMessage]
-    setMessages(nextMessages)
-    setInput('')
-    setIsStreaming(true)
-
-    setMessages(prev => [...prev, { role: 'assistant', content: '' }])
-
-    try {
-      const res = await apiFetch('/api/chat', {
-        method: 'POST',
-        body: JSON.stringify({ project_id: activeProject.id, messages: nextMessages }),
-      })
-
-      if (!res.ok) throw new Error(`API error: ${res.status}`)
-
-      const reader = res.body.getReader()
-      const decoder = new TextDecoder()
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        const chunk = decoder.decode(value, { stream: true })
-        setMessages(prev => {
-          const updated = [...prev]
-          updated[updated.length - 1] = {
-            ...updated[updated.length - 1],
-            content: updated[updated.length - 1].content + chunk,
-          }
-          return updated
+    function onMouseUp() {
+      document.removeEventListener('mouseup', onMouseUp)
+      const { from, to } = dragRef.current
+      setDraggingIndex(null)
+      setDragOverIndex(null)
+      if (from !== to) {
+        setOpenPanels(prev => {
+          const next = [...prev]
+          const [item] = next.splice(from, 1)
+          next.splice(to, 0, item)
+          return next
         })
       }
-    } catch (err) {
-      setMessages(prev => {
-        const updated = [...prev]
-        updated[updated.length - 1] = {
-          ...updated[updated.length - 1],
-          content: `Error: ${err.message}`,
-        }
-        return updated
-      })
-    } finally {
-      setIsStreaming(false)
     }
+
+    document.addEventListener('mouseup', onMouseUp)
+  }
+
+  function handleDragOver(index) {
+    setDragOverIndex(index)
+    dragRef.current.to = index
+  }
+
+  useEffect(() => {
+    if (draggingIndex != null) {
+      document.body.style.cursor = 'grabbing'
+      document.body.style.userSelect = 'none'
+    } else {
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+    return () => {
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+  }, [draggingIndex])
+
+  function handleResize(leftId, rightId, dx) {
+    setPanelWidths(prev => {
+      const leftW = (prev[leftId] ?? DEFAULT_WIDTHS[leftId] ?? 360) + dx
+      if (leftW < MIN_WIDTH) return prev
+      const rightIsLast = openPanels[openPanels.length - 1] === rightId
+      if (rightIsLast) {
+        const containerW = panelContainerRef.current?.offsetWidth ?? 0
+        const handleTotalW = (openPanels.length - 1) * 4
+        const nonLastTotalW = openPanels.slice(0, -1).reduce((sum, id) => {
+          return sum + (id === leftId ? leftW : (prev[id] ?? DEFAULT_WIDTHS[id] ?? 360))
+        }, 0)
+        if (containerW - nonLastTotalW - handleTotalW < MIN_WIDTH) return prev
+        return { ...prev, [leftId]: leftW }
+      }
+      const rightW = (prev[rightId] ?? DEFAULT_WIDTHS[rightId] ?? 360) - dx
+      if (rightW < MIN_WIDTH) return prev
+      return { ...prev, [leftId]: leftW, [rightId]: rightW }
+    })
   }
 
   if (projectsLoading) return null
 
-  return (
-    <div className="flex flex-col h-screen bg-gray-50">
-      <header className="px-4 py-3 border-b bg-white shadow-sm flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2 min-w-0">
-          <ProjectSwitcher />
-        </div>
-        <div className="flex items-center gap-2 shrink-0">
-          {showNewContext ? (
-            <NewContextForm projectId={activeProject?.id} onCreated={handleContextCreated} />
-          ) : (
-            <button
-              onClick={() => setShowNewContext(true)}
-              className="text-xs text-gray-500 hover:text-blue-600 border border-gray-200 rounded px-2 py-1 transition-colors"
-            >
-              + Context
-            </button>
-          )}
-          <button
-            onClick={handleLogout}
-            className="text-xs text-gray-400 hover:text-gray-600 transition-colors"
-          >
-            Sign out
-          </button>
-        </div>
-      </header>
+  // Build interleaved [panel, handle, panel, handle, panel] list
+  const panelElements = []
+  openPanels.forEach((panelId, i) => {
+    const width = panelWidths[panelId] ?? DEFAULT_WIDTHS[panelId] ?? 360
+    const isDragging = draggingIndex === i
+    const isDropTarget = draggingIndex != null && dragOverIndex === i && dragOverIndex !== draggingIndex
 
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">
-        {messages.length === 0 && (
-          <p className="text-center text-gray-400 mt-16 text-sm">
-            Paste some text in your target language to get started.
-          </p>
-        )}
-        {messages.map((msg, i) => (
-          <ChatMessage
-            key={i}
-            role={msg.role}
-            content={msg.content}
-            sourceRefMap={sourceRefMap}
-            onSourceRegistered={handleSourceRegistered}
-            onSourceSaved={handleSourceSaved}
-            contexts={contexts}
-            tagCatalog={tagCatalog}
-            onNewTags={refreshTagCatalog}
-            projectId={activeProject?.id}
-          />
-        ))}
-        <div ref={bottomRef} />
-      </div>
-
-      <form
-        onSubmit={sendMessage}
-        className="px-4 py-3 border-t bg-white flex gap-2"
-      >
-        <input
-          className="flex-1 rounded-lg border border-gray-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 disabled:bg-gray-100"
-          placeholder="Type a message…"
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          disabled={isStreaming || !activeProject}
-          autoFocus
+    if (i > 0) {
+      panelElements.push(
+        <ResizeHandle
+          key={`resize-${i}`}
+          onDrag={dx => handleResize(openPanels[i - 1], panelId, dx)}
         />
-        <button
-          type="submit"
-          disabled={isStreaming || !input.trim() || !activeProject}
-          className="px-4 py-2 rounded-lg bg-blue-500 text-white text-sm font-medium hover:bg-blue-600 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-        >
-          {isStreaming ? 'Thinking…' : 'Send'}
-        </button>
-      </form>
+      )
+    }
+
+    const isLast = i === openPanels.length - 1
+    const onDragStart = (e) => handlePanelDragStart(i, e)
+    const onClose = panelId === 'source-detail' ? handleCloseSourceDetail : () => togglePanel(panelId)
+
+    panelElements.push(
+      <div
+        key={panelId}
+        className={`relative overflow-hidden ${isLast ? 'flex-1' : 'border-r border-gray-200 shrink-0'} ${isDragging ? 'opacity-50' : ''}`}
+        style={isLast ? { minWidth: MIN_WIDTH } : { width, minWidth: MIN_WIDTH }}
+        onMouseEnter={() => draggingIndex != null && draggingIndex !== i && handleDragOver(i)}
+      >
+        {isDropTarget && (
+          <div className="absolute inset-y-0 left-0 w-0.5 bg-blue-500 z-20 pointer-events-none" />
+        )}
+        {renderPanel(panelId, {
+          activeProject,
+          contexts,
+          setContexts,
+          tagCatalog,
+          onNewTags: refreshTagCatalog,
+          selectedSource,
+          onSelectSource: handleSelectSource,
+          onCloseSourceDetail: handleCloseSourceDetail,
+          selectedCard,
+          onSelectCard: handleSelectCard,
+          onCloseCardDetail: handleCloseCardDetail,
+          chatInput,
+          onChatInputChange: setChatInput,
+          onAppendToChat: handleAppendToChat,
+          onDragStart,
+          onClose,
+        })}
+      </div>
+    )
+  })
+
+  return (
+    <div className="flex h-screen overflow-hidden">
+      <Sidebar
+        openPanels={openPanels}
+        onToggle={togglePanel}
+        onLogout={handleLogout}
+        header={<ProjectSwitcher />}
+      />
+      <div ref={panelContainerRef} className="flex flex-1 overflow-hidden">
+        {panelElements}
+      </div>
     </div>
   )
+}
+
+function renderPanel(id, props) {
+  const {
+    activeProject, contexts, setContexts, tagCatalog, onNewTags,
+    selectedSource, onSelectSource,
+    selectedCard, onSelectCard, onCloseCardDetail,
+    chatInput, onChatInputChange, onAppendToChat, onDragStart, onClose,
+  } = props
+
+  switch (id) {
+    case 'chat':
+      return (
+        <ChatPanel
+          activeProject={activeProject}
+          contexts={contexts}
+          tagCatalog={tagCatalog}
+          onNewTags={onNewTags}
+          input={chatInput}
+          onInputChange={onChatInputChange}
+          onDragStart={onDragStart}
+          onClose={onClose}
+        />
+      )
+    case 'sources':
+      return (
+        <SourcesPanel
+          activeProject={activeProject}
+          onSelectSource={onSelectSource}
+          selectedSourceId={selectedSource?.id}
+          onAppendToChat={onAppendToChat}
+          onDragStart={onDragStart}
+          onClose={onClose}
+        />
+      )
+    case 'source-detail':
+      return (
+        <SourceDetailPanel
+          source={selectedSource}
+          activeProject={activeProject}
+          onClose={onClose}
+          onAppendToChat={onAppendToChat}
+          onDragStart={onDragStart}
+        />
+      )
+    case 'cards':
+      return (
+        <CardsPanel
+          activeProject={activeProject}
+          onSelectCard={onSelectCard}
+          selectedCardId={selectedCard?.id}
+          onDragStart={onDragStart}
+          onClose={onClose}
+        />
+      )
+    case 'card-detail':
+      return (
+        <CardDetailPanel
+          card={selectedCard}
+          activeProject={activeProject}
+          onClose={onCloseCardDetail}
+          onAppendToChat={onAppendToChat}
+          onDragStart={onDragStart}
+        />
+      )
+    case 'tags':
+      return (
+        <TagsPanel
+          activeProject={activeProject}
+          tagCatalog={tagCatalog}
+          onDragStart={onDragStart}
+          onClose={onClose}
+        />
+      )
+    case 'contexts':
+      return (
+        <ContextsPanel
+          activeProject={activeProject}
+          contexts={contexts}
+          setContexts={setContexts}
+          onDragStart={onDragStart}
+          onClose={onClose}
+        />
+      )
+    default:
+      return null
+  }
 }

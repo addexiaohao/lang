@@ -37,10 +37,10 @@ export function ProjectProvider({ children }) {
     setDefaultProjectId(projectId)
   }
 
-  async function createProject(name, config) {
+  async function createProject(name, fields = {}) {
     const res = await apiFetch('/api/projects', {
       method: 'POST',
-      body: JSON.stringify({ name, config }),
+      body: JSON.stringify({ name, ...fields }),
     })
     const data = await res.json()
     if (!res.ok) throw new Error(data.error ?? 'Failed to create project')

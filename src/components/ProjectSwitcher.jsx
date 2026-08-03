@@ -105,8 +105,8 @@ function NewProjectModal({ onClose }) {
     setSaving(true)
     try {
       await createProject(name.trim(), {
-        tts_locale: locale.trim() || undefined,
-        contexts_required: contextsRequired,
+        tts_locale: locale.trim() || null,
+        context_required: contextsRequired,
       })
       onClose()
     } catch (err) {

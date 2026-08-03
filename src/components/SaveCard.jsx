@@ -1,16 +1,16 @@
 import { useState, useEffect, forwardRef, useImperativeHandle } from 'react'
 import { speak } from '../tts.js'
 import GermanText from './GermanText.jsx'
-import { apiFetch } from '../apiFetch.js'
 import { useProject } from '../ProjectContext.jsx'
 import { getProjectConfig } from '../../lib/projectConfig.js'
+import { apiFetch } from '../apiFetch.js'
 
 const TABLE_LABELS = {
   source: 'Source',
   knowledge_card: 'Knowledge Card',
 }
 
-const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState = { status: 'idle' }, blocked = false, validationWarnings = [], unknownFields = [], contexts, sourceText, tagCatalog = [], onNewTags, linkState, onLink }, ref) {
+const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState = { status: 'idle' }, blocked = false, validationWarnings = [], unknownFields = [], contexts, sourceText, tagCatalog = [], proposedTagMeta = {}, linkState, onLink }, ref) {
   const { activeProject } = useProject()
   const { ttsLocale, contextsRequired } = getProjectConfig(activeProject ?? {})
   const [fields, setFields] = useState(() => {
@@ -34,37 +34,6 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
     } catch { return [] }
   })
 
-  // Per-unknown-tag metadata: { [originalTagName]: { addToCatalog, name, displayName, description } }
-  // Seeded from model's new_tags hints (proposed both name and display_name)
-  const [newTagMeta, setNewTagMeta] = useState(() => {
-    if (table !== 'knowledge_card') return {}
-    const hints = Array.isArray(record.new_tags) ? record.new_tags : []
-    const meta = {}
-    for (const h of hints) {
-      if (h.name) {
-        meta[h.name] = { addToCatalog: true, name: h.name, displayName: h.display_name ?? '', description: '' }
-      }
-    }
-    return meta
-  })
-  const [tagInput, setTagInput] = useState('')
-
-  // When catalog loads, initialize meta for any unknown tags not already in meta
-  useEffect(() => {
-    if (!tagCatalog.length) return
-    const catalogSet = new Set(tagCatalog.map(t => t.name))
-    setNewTagMeta(prev => {
-      const next = { ...prev }
-      let changed = false
-      for (const t of tagList) {
-        if (!catalogSet.has(t) && !next[t]) {
-          next[t] = { addToCatalog: true, name: t, displayName: '', description: '' }
-          changed = true
-        }
-      }
-      return changed ? next : prev
-    })
-  }, [tagCatalog, tagList])
 
   const complexFields = new Set(
     Object.keys(record).filter(k => typeof record[k] === 'object' && record[k] !== null && k !== 'new_tags')
@@ -97,60 +66,14 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
     setFields(prev => ({ ...prev, [key]: value }))
   }
 
-  function addTag(raw) {
-    const tag = raw.trim().toLowerCase()
-    if (!tag || tagList.includes(tag)) return
-    setTagList(prev => [...prev, tag])
-    if (!catalogSet.has(tag)) {
-      setNewTagMeta(prev => ({ ...prev, [tag]: { addToCatalog: true, name: tag, displayName: '', description: '' } }))
-    }
-  }
-
   function removeTag(tag) {
     setTagList(prev => prev.filter(t => t !== tag))
   }
 
-  function updateTagMeta(tag, patch) {
-    setNewTagMeta(prev => ({
-      ...prev,
-      [tag]: { ...(prev[tag] ?? { addToCatalog: true, name: tag, displayName: '', description: '' }), ...patch },
-    }))
-  }
-
   async function handleSaveClick() {
-    // Determine final tags: known + confirmed-new; drop unchecked new tags
-    // For new tags, use the (possibly edited) name from meta
-    const finalTags = tagList
-      .filter(t => {
-        if (catalogSet.has(t)) return true
-        return (newTagMeta[t]?.addToCatalog ?? true)
-      })
-      .map(t => {
-        if (!catalogSet.has(t)) return newTagMeta[t]?.name || t
-        return t
-      })
-
-    // Post new confirmed tags to catalog (best-effort)
-    const tagsToCreate = tagList.filter(t => !catalogSet.has(t) && (newTagMeta[t]?.addToCatalog ?? true))
-    for (const originalName of tagsToCreate) {
-      const meta = newTagMeta[originalName] ?? {}
-      try {
-        await apiFetch('/api/tags', {
-          method: 'POST',
-          body: JSON.stringify({
-            project_id: activeProject?.id,
-            name: meta.name || originalName,
-            display_name: meta.displayName || undefined,
-          }),
-        })
-      } catch { /* best-effort */ }
-    }
-    if (tagsToCreate.length > 0) onNewTags?.()
-
     const finalFields = table === 'knowledge_card'
-      ? { ...fields, tags: JSON.stringify(finalTags) }
+      ? { ...fields, tags: JSON.stringify(tagList) }
       : fields
-
     await onSave(table, finalFields)
   }
 
@@ -162,7 +85,8 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
   const isSaving = status === 'saving'
   const isSaved = status === 'saved'
   const needsContext = table === 'source' && contextsRequired && !fields.context_id
-  const isDisabled = isSaving || isSaved || blocked || needsContext
+  const hasUnconfirmedTags = table === 'knowledge_card' && tagList.some(t => !catalogSet.has(t))
+  const isDisabled = isSaving || isSaved || blocked || needsContext || hasUnconfirmedTags
 
   return (
     <div className="border border-blue-200 rounded-xl bg-blue-50 p-3 space-y-2 text-sm">
@@ -183,7 +107,7 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
                   : 'bg-blue-500 text-white hover:bg-blue-600'
           }`}
         >
-          {isSaved ? 'Saved' : isSaving ? 'Saving…' : blocked ? 'Save source first' : needsContext ? 'Select a context' : 'Save'}
+          {isSaved ? 'Saved' : isSaving ? 'Saving…' : hasUnconfirmedTags ? 'Confirm tags first' : blocked ? 'Save source first' : needsContext ? 'Select a context' : 'Save'}
         </button>
       </div>
 
@@ -240,20 +164,18 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
 
       {Object.entries(fields).map(([key, value]) => {
         if (key === 'tags' && table === 'knowledge_card') {
-          const unknownInList = tagList.filter(t => tagCatalog.length > 0 && !catalogSet.has(t))
           return (
             <div key={key}>
               <label className="block text-xs mb-1 text-gray-500">tags</label>
-              <div className="flex flex-wrap gap-1 mb-1">
+              <div className="flex flex-wrap gap-1">
                 {tagList.map(tag => {
-                  const isNew = tagCatalog.length > 0 && !catalogSet.has(tag)
+                  const isProposed = !catalogSet.has(tag)
                   const catalogEntry = catalogMap.get(tag)
-                  const label = isNew
-                    ? (newTagMeta[tag]?.name || tag)
+                  const label = isProposed
+                    ? (proposedTagMeta[tag]?.displayName || tag)
                     : (catalogEntry?.display_name || tag)
                   return (
-                    <span key={tag} className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${isNew ? 'bg-amber-100 text-amber-800 border border-amber-300' : 'bg-blue-100 text-blue-700'}`}>
-                      {isNew && <span className="text-[9px] font-bold uppercase tracking-wide opacity-70">new</span>}
+                    <span key={tag} className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${isProposed ? 'bg-amber-100 text-amber-800 border border-amber-300' : 'bg-blue-100 text-blue-700'}`}>
                       {label}
                       {!isSaved && (
                         <button onClick={() => removeTag(tag)} className="ml-0.5 leading-none hover:text-red-500 text-gray-400">×</button>
@@ -262,57 +184,6 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
                   )
                 })}
               </div>
-
-              {unknownInList.map(tag => (
-                <div key={tag} className="border border-amber-200 rounded-lg bg-amber-50 px-2 py-2 mb-1 space-y-1.5">
-                  <label className="flex items-center gap-2 text-xs text-amber-800 cursor-pointer font-medium">
-                    <input
-                      type="checkbox"
-                      checked={newTagMeta[tag]?.addToCatalog ?? true}
-                      onChange={e => updateTagMeta(tag, { addToCatalog: e.target.checked })}
-                    />
-                    Add to catalog
-                  </label>
-                  {(newTagMeta[tag]?.addToCatalog ?? true) && (
-                    <div className="grid grid-cols-2 gap-1.5">
-                      <div>
-                        <label className="block text-[10px] text-amber-700 mb-0.5">name</label>
-                        <input
-                          className="w-full text-xs font-mono border border-amber-200 rounded px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-amber-400"
-                          placeholder="verb-irregular-present"
-                          value={newTagMeta[tag]?.name ?? tag}
-                          onChange={e => updateTagMeta(tag, { name: e.target.value })}
-                        />
-                      </div>
-                      <div>
-                        <label className="block text-[10px] text-amber-700 mb-0.5">display</label>
-                        <input
-                          className="w-full text-xs font-mono border border-amber-200 rounded px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-amber-400"
-                          placeholder="irr-present"
-                          value={newTagMeta[tag]?.displayName ?? ''}
-                          onChange={e => updateTagMeta(tag, { displayName: e.target.value })}
-                        />
-                      </div>
-                    </div>
-                  )}
-                </div>
-              ))}
-
-              {!isSaved && (
-                <input
-                  className="w-full text-xs border border-gray-200 rounded px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
-                  placeholder="Add tag and press Enter…"
-                  value={tagInput}
-                  onChange={e => setTagInput(e.target.value)}
-                  onKeyDown={e => {
-                    if ((e.key === 'Enter' || e.key === ',') && tagInput.trim()) {
-                      e.preventDefault()
-                      addTag(tagInput)
-                      setTagInput('')
-                    }
-                  }}
-                />
-              )}
             </div>
           )
         }
