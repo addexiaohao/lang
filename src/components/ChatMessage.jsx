@@ -246,6 +246,13 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
   const [savedCellRefs, setSavedCellRefs] = useState({})
   const savedCellRefsRef = useRef({})
 
+  // User corrections to the agent-emitted annotated_sentence, keyed by blockIndex.
+  // Falls back to the parsed block's original annotatedSentence when absent.
+  const [editedAnnotatedSentences, setEditedAnnotatedSentences] = useState({})
+  const updateAnnotatedSentence = useCallback((bi, value) => {
+    setEditedAnnotatedSentences(prev => ({ ...prev, [bi]: value }))
+  }, [])
+
   useEffect(() => {
     if (isUser) return
 
@@ -318,7 +325,8 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
           : savedSourceIdsRef.current[block.sourceGroupIndex]
         record = { ...record, source_id: sourceId }
       }
-      if (block.annotatedSentence) record = { ...record, annotated_sentence: block.annotatedSentence }
+      const annotatedSentence = editedAnnotatedSentences[bi] ?? block.annotatedSentence
+      if (annotatedSentence) record = { ...record, annotated_sentence: annotatedSentence }
       const res = await apiFetch('/api/save', {
         method: 'POST',
         body: JSON.stringify({ project_id: projectId, table, record }),
@@ -360,7 +368,8 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
     setLinkStates(prev => prev.map((s, i) => i === bi ? { status: 'linking' } : s))
     try {
       const linkRecord = { source_id: sourceId, knowledge_card_id: cardId }
-      if (block.annotatedSentence) linkRecord.annotated_sentence = block.annotatedSentence
+      const annotatedSentence = editedAnnotatedSentences[bi] ?? block.annotatedSentence
+      if (annotatedSentence) linkRecord.annotated_sentence = annotatedSentence
       const res = await apiFetch('/api/save', {
         method: 'POST',
         body: JSON.stringify({ project_id: projectId, table: 'source_knowledge', record: linkRecord }),
@@ -486,6 +495,8 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
                   linkState={linkStates[bi] ?? { status: 'idle' }}
                   onLink={() => handleLink(bi)}
                   sourceId={sourceId}
+                  annotatedSentence={editedAnnotatedSentences[bi] ?? segment.annotatedSentence}
+                  onAnnotatedSentenceChange={value => updateAnnotatedSentence(bi, value)}
                 />
               )
             }
@@ -575,6 +586,8 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
                 onNewTags={onNewTags}
                 linkState={segment.table === 'knowledge_card' ? (linkStates[bi] ?? { status: 'idle' }) : undefined}
                 onLink={segment.table === 'knowledge_card' ? (cardId) => handleLink(bi, cardId) : undefined}
+                annotatedSentence={editedAnnotatedSentences[bi] ?? segment.annotatedSentence}
+                onAnnotatedSentenceChange={value => updateAnnotatedSentence(bi, value)}
               />
             )
           }

@@ -146,9 +146,7 @@ Test: *can you figure it out from its components?* If no — it's an expression.
   "kind": "expression",
   "name": "Mahlzeit",
   "tags": ["colloquial", "sarcasm"],
-  "details": {
-    "register": "colloquial"
-  }
+  "details": {}
 }
 ```
 
@@ -157,9 +155,7 @@ Test: *can you figure it out from its components?* If no — it's an expression.
   "kind": "expression",
   "name": "na ja",
   "tags": ["filler", "spoken"],
-  "details": {
-    "register": "casual"
-  }
+  "details": {}
 }
 ```
 

@@ -1,12 +1,23 @@
-import { forwardRef, useImperativeHandle } from 'react'
+import { forwardRef, useImperativeHandle, useState } from 'react'
+import { HighlightedText } from './HighlightedText.jsx'
+import AnnotatedSpanEditor from './AnnotatedSpanEditor.jsx'
+import { stripMarkers, applyMarkers } from '../../lib/annotationMarkers.js'
 
-const LinkCard = forwardRef(function LinkCard({ record, linkState = { status: 'idle' }, onLink, sourceId }, ref) {
+const LinkCard = forwardRef(function LinkCard({ record, linkState = { status: 'idle' }, onLink, sourceId, annotatedSentence, onAnnotatedSentenceChange }, ref) {
   useImperativeHandle(ref, () => ({ save: onLink }))
 
   const { status, error } = linkState
   const isLinked = status === 'linked'
   const isLinking = status === 'linking'
   const isDisabled = !sourceId || isLinking || isLinked
+
+  const [editingSpan, setEditingSpan] = useState(false)
+  let sentenceInfo = null
+  try {
+    if (annotatedSentence) sentenceInfo = stripMarkers(annotatedSentence)
+  } catch {
+    sentenceInfo = null
+  }
 
   const tags = Array.isArray(record.tags) ? record.tags : []
 
@@ -56,6 +67,39 @@ const LinkCard = forwardRef(function LinkCard({ record, linkState = { status: 'i
           </div>
         )}
       </div>
+
+      {sentenceInfo && (
+        <div className="rounded-md bg-white border border-gray-200 px-2 py-1.5 space-y-1.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Position in sentence</span>
+            {!editingSpan && !isLinked && (
+              <button
+                type="button"
+                onClick={() => setEditingSpan(true)}
+                className="text-[10px] text-purple-500 hover:text-purple-700 font-medium"
+              >
+                Edit
+              </button>
+            )}
+          </div>
+          {editingSpan ? (
+            <AnnotatedSpanEditor
+              text={sentenceInfo.text}
+              positions={sentenceInfo.positions}
+              highlightClassName="bg-purple-200 text-purple-900"
+              onChange={ranges => {
+                onAnnotatedSentenceChange?.(applyMarkers(sentenceInfo.text, ranges))
+                setEditingSpan(false)
+              }}
+              onCancel={() => setEditingSpan(false)}
+            />
+          ) : (
+            <p className="text-xs text-gray-700 leading-relaxed">
+              <HighlightedText text={sentenceInfo.text} positions={sentenceInfo.positions} highlightClassName="bg-yellow-200 text-yellow-900" />
+            </p>
+          )}
+        </div>
+      )}
 
       {status === 'error' && (
         <p className="text-xs text-red-500">{error}</p>

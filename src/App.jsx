@@ -35,6 +35,7 @@ export default function App() {
   const [panelWidths, setPanelWidths] = useState({ chat: DEFAULT_WIDTHS.chat })
   const [selectedSource, setSelectedSource] = useState(null)
   const [selectedCard, setSelectedCard] = useState(null)
+  const [selectedTag, setSelectedTag] = useState(null)
   const [chatInput, setChatInput] = useState('')
   const [draggingIndex, setDraggingIndex] = useState(null)
   const [dragOverIndex, setDragOverIndex] = useState(null)
@@ -77,6 +78,10 @@ export default function App() {
           setSelectedCard(null)
           return prev.filter(p => p !== id && p !== 'card-detail')
         }
+        if (id === 'tags') {
+          setSelectedTag(null)
+          return prev.filter(p => p !== id)
+        }
         return prev.filter(p => p !== id)
       }
       setPanelWidths(w => ({ ...w, [id]: DEFAULT_WIDTHS[id] ?? 360 }))
@@ -98,6 +103,18 @@ export default function App() {
   function handleCloseCardDetail() {
     setSelectedCard(null)
     setOpenPanels(prev => prev.filter(p => p !== 'card-detail'))
+  }
+
+  function handleSelectTag(tagName) {
+    setSelectedTag(tagName)
+    if (!tagName) return
+    setOpenPanels(prev => {
+      if (!prev.includes('tags')) {
+        setPanelWidths(w => ({ ...w, tags: DEFAULT_WIDTHS.tags }))
+        return [...prev, 'tags']
+      }
+      return prev
+    })
   }
 
   function handleSelectSource(source) {
@@ -232,6 +249,8 @@ export default function App() {
           selectedCard,
           onSelectCard: handleSelectCard,
           onCloseCardDetail: handleCloseCardDetail,
+          selectedTag,
+          onSelectTag: handleSelectTag,
           chatInput,
           onChatInputChange: setChatInput,
           onAppendToChat: handleAppendToChat,
@@ -262,6 +281,7 @@ function renderPanel(id, props) {
     activeProject, contexts, setContexts, tagCatalog, onNewTags,
     selectedSource, onSelectSource,
     selectedCard, onSelectCard, onCloseCardDetail,
+    selectedTag, onSelectTag,
     chatInput, onChatInputChange, onAppendToChat, onDragStart, onClose,
   } = props
 
@@ -318,6 +338,7 @@ function renderPanel(id, props) {
           onClose={onCloseCardDetail}
           onAppendToChat={onAppendToChat}
           onDragStart={onDragStart}
+          onSelectTag={onSelectTag}
         />
       )
     case 'tags':
@@ -325,8 +346,13 @@ function renderPanel(id, props) {
         <TagsPanel
           activeProject={activeProject}
           tagCatalog={tagCatalog}
+          onNewTags={onNewTags}
           onDragStart={onDragStart}
           onClose={onClose}
+          selectedTag={selectedTag}
+          onSelectTag={onSelectTag}
+          onSelectCard={onSelectCard}
+          selectedCardId={selectedCard?.id}
         />
       )
     case 'contexts':

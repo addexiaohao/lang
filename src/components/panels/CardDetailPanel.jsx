@@ -38,10 +38,11 @@ const KIND_COLORS = {
   table: 'bg-blue-100 text-blue-700',
 }
 
-export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, onDragStart }) {
+export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, onDragStart, onSelectTag }) {
   const [detail, setDetail] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+  const [savingImportance, setSavingImportance] = useState(false)
 
   useEffect(() => {
     if (!card || !activeProject) return
@@ -54,6 +55,27 @@ export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, 
       .catch(e => setError(String(e)))
       .finally(() => setLoading(false))
   }, [card?.id, activeProject?.id])
+
+  const importance = detail?.importance ?? card?.importance ?? null
+
+  async function updateImportance(value) {
+    if (!card || !activeProject || value === importance) return
+    setSavingImportance(true)
+    try {
+      const r = await apiFetch(`/api/knowledge-cards?project_id=${activeProject.id}&id=${card.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ importance: value }),
+      })
+      if (!r.ok) throw new Error(r.statusText)
+      const updated = await r.json()
+      setDetail(prev => prev ? { ...prev, importance: updated.importance } : prev)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setSavingImportance(false)
+    }
+  }
 
   const sources = detail?.source_knowledge
     ?.map(sk => sk.sources ? { ...sk.sources, positions: sk.positions ?? [] } : null)
@@ -96,7 +118,13 @@ export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, 
             {card.tags?.length > 0 && (
               <div className="flex flex-wrap gap-1 mt-2">
                 {card.tags.map(tag => (
-                  <span key={tag} className="text-[10px] bg-gray-100 text-gray-500 rounded px-1.5 py-0.5">{tag}</span>
+                  <button
+                    key={tag}
+                    onClick={() => onSelectTag?.(tag)}
+                    className="text-[10px] bg-gray-100 text-gray-500 hover:bg-gray-200 rounded px-1.5 py-0.5 transition-colors"
+                  >
+                    {tag}
+                  </button>
                 ))}
               </div>
             )}
@@ -113,12 +141,25 @@ export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, 
                   <span className="text-[10px] text-gray-500">{card.skill}/10</span>
                 </div>
               )}
-              {card.importance != null && (
-                <div className="flex items-center gap-1">
-                  <span className="text-[10px] text-gray-400">Importance</span>
-                  <span className="text-[10px] font-medium text-gray-600">{card.importance}/10</span>
+              <div className="flex items-center gap-1.5">
+                <span className="text-[10px] text-gray-400">Importance</span>
+                <div className="flex gap-0.5">
+                  {Array.from({ length: 10 }, (_, i) => {
+                    const value = i + 1
+                    const filled = importance != null && value <= importance
+                    return (
+                      <button
+                        key={value}
+                        onClick={() => updateImportance(value)}
+                        disabled={savingImportance}
+                        title={`Set importance to ${value}`}
+                        className={`w-2 h-2 rounded-sm transition-colors disabled:cursor-wait ${filled ? 'bg-amber-500' : 'bg-gray-200 hover:bg-amber-200'}`}
+                      />
+                    )
+                  })}
                 </div>
-              )}
+                <span className="text-[10px] text-gray-500">{importance != null ? `${importance}/10` : '—'}</span>
+              </div>
             </div>
           </div>
 

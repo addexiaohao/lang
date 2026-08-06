@@ -7,15 +7,27 @@ export function ChatPanel({ activeProject, contexts, tagCatalog, onNewTags, inpu
   const [isStreaming, setIsStreaming] = useState(false)
   const [sourceRefMap, setSourceRefMap] = useState({})
   const bottomRef = useRef(null)
+  const scrollContainerRef = useRef(null)
+  const stickToBottomRef = useRef(true)
 
   useEffect(() => {
     setMessages([])
     setSourceRefMap({})
+    stickToBottomRef.current = true
   }, [activeProject?.id])
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (stickToBottomRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [messages])
+
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    stickToBottomRef.current = distanceFromBottom < 80
+  }, [])
 
   const handleSourceRegistered = useCallback((ref, text) => {
     setSourceRefMap(prev => ({ ...prev, [ref]: { ...(prev[ref] ?? {}), text } }))
@@ -32,6 +44,7 @@ export function ChatPanel({ activeProject, contexts, tagCatalog, onNewTags, inpu
 
     const userMessage = { role: 'user', content: text }
     const nextMessages = [...messages, userMessage]
+    stickToBottomRef.current = true
     setMessages(nextMessages)
     onInputChange('')
     setIsStreaming(true)
@@ -104,7 +117,7 @@ export function ChatPanel({ activeProject, contexts, tagCatalog, onNewTags, inpu
         </button>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-3 py-3 space-y-4">
+      <div ref={scrollContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto px-3 py-3 space-y-4">
         {messages.length === 0 && (
           <p className="text-center text-gray-400 mt-16 text-sm">
             Paste some text in your target language to get started.

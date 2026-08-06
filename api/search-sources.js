@@ -1,5 +1,6 @@
 import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
+import { findDuplicateSource } from '../lib/normalizeSourceText.js'
 
 export default async function handler(req, res) {
   if (req.method !== 'GET') {
@@ -27,10 +28,9 @@ export default async function handler(req, res) {
   const { data, error } = await supabase
     .from('sources')
     .select('id, original_text')
-    .eq('original_text', q)
     .eq('project_id', project_id)
-    .limit(1)
 
   if (error) return res.status(500).json({ error: error.message })
-  return res.status(200).json(data)
+  const match = findDuplicateSource(data ?? [], q)
+  return res.status(200).json(match ? [match] : [])
 }

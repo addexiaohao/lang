@@ -1,8 +1,10 @@
 import { useState, useEffect, forwardRef, useImperativeHandle } from 'react'
 import { speak } from '../tts.js'
 import GermanText from './GermanText.jsx'
+import AnnotatedSpanEditor from './AnnotatedSpanEditor.jsx'
 import { useProject } from '../ProjectContext.jsx'
 import { getProjectConfig } from '../../lib/projectConfig.js'
+import { stripMarkers, applyMarkers } from '../../lib/annotationMarkers.js'
 import { apiFetch } from '../apiFetch.js'
 
 const TABLE_LABELS = {
@@ -10,7 +12,7 @@ const TABLE_LABELS = {
   knowledge_card: 'Knowledge Card',
 }
 
-const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState = { status: 'idle' }, blocked = false, validationWarnings = [], unknownFields = [], contexts, sourceText, tagCatalog = [], proposedTagMeta = {}, linkState, onLink }, ref) {
+const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState = { status: 'idle' }, blocked = false, validationWarnings = [], unknownFields = [], contexts, sourceText, tagCatalog = [], proposedTagMeta = {}, linkState, onLink, annotatedSentence, onAnnotatedSentenceChange }, ref) {
   const { activeProject } = useProject()
   const { ttsLocale, contextsRequired } = getProjectConfig(activeProject ?? {})
   const [fields, setFields] = useState(() => {
@@ -43,7 +45,26 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
   const catalogSet = new Set(tagCatalog.map(t => t.name))
   const catalogMap = new Map(tagCatalog.map(t => [t.name, t]))
 
+  const [editingSpan, setEditingSpan] = useState(false)
+  let sentenceInfo = null
+  try {
+    if (annotatedSentence) sentenceInfo = stripMarkers(annotatedSentence)
+  } catch {
+    sentenceInfo = null
+  }
+  // Positions of the annotated span relative to the full sourceText (which may
+  // contain more than just the annotated sentence), for highlighting inline.
+  let annotatedPositions = []
+  if (sentenceInfo && sourceText) {
+    const offset = sourceText.indexOf(sentenceInfo.text)
+    if (offset !== -1) {
+      annotatedPositions = sentenceInfo.positions.map(p => ({ start: p.start + offset, end: p.end + offset }))
+    }
+  }
+
   const [existingCard, setExistingCard] = useState(null)
+  const [showTagPicker, setShowTagPicker] = useState(false)
+  const [tagSearch, setTagSearch] = useState('')
 
   useEffect(() => {
     if (table === 'knowledge_card' && fields.name && activeProject) {
@@ -68,6 +89,12 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
 
   function removeTag(tag) {
     setTagList(prev => prev.filter(t => t !== tag))
+  }
+
+  function addTag(tag) {
+    setTagList(prev => prev.includes(tag) ? prev : [...prev, tag])
+    setShowTagPicker(false)
+    setTagSearch('')
   }
 
   async function handleSaveClick() {
@@ -112,8 +139,34 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
       </div>
 
       {sourceText && (
-        <div className="rounded-md bg-gray-50 border border-gray-200 px-2 py-1.5">
-          <p className="text-xs text-gray-600 italic"><GermanText>{sourceText}</GermanText></p>
+        <div className="rounded-md bg-gray-50 border border-gray-200 px-2 py-1.5 space-y-1.5">
+          {editingSpan && sentenceInfo ? (
+            <AnnotatedSpanEditor
+              text={sentenceInfo.text}
+              positions={sentenceInfo.positions}
+              highlightClassName="bg-blue-200 text-blue-900"
+              onChange={ranges => {
+                onAnnotatedSentenceChange?.(applyMarkers(sentenceInfo.text, ranges))
+                setEditingSpan(false)
+              }}
+              onCancel={() => setEditingSpan(false)}
+            />
+          ) : (
+            <div className="flex items-start gap-2">
+              <p className="text-xs text-gray-600 italic flex-1">
+                <GermanText positions={annotatedPositions}>{sourceText}</GermanText>
+              </p>
+              {sentenceInfo && !isSaved && (
+                <button
+                  type="button"
+                  onClick={() => setEditingSpan(true)}
+                  className="shrink-0 text-[10px] text-blue-500 hover:text-blue-700 font-medium"
+                >
+                  Edit
+                </button>
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -164,10 +217,19 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
 
       {Object.entries(fields).map(([key, value]) => {
         if (key === 'tags' && table === 'knowledge_card') {
+          const pickerOptions = tagCatalog
+            .filter(t => !tagList.includes(t.name))
+            .filter(t => {
+              const q = tagSearch.trim().toLowerCase()
+              if (!q) return true
+              return t.name.toLowerCase().includes(q) || (t.display_name ?? '').toLowerCase().includes(q)
+            })
+            .sort((a, b) => a.name.localeCompare(b.name))
+
           return (
-            <div key={key}>
+            <div key={key} className="relative">
               <label className="block text-xs mb-1 text-gray-500">tags</label>
-              <div className="flex flex-wrap gap-1">
+              <div className="flex flex-wrap items-center gap-1">
                 {tagList.map(tag => {
                   const isProposed = !catalogSet.has(tag)
                   const catalogEntry = catalogMap.get(tag)
@@ -183,7 +245,57 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
                     </span>
                   )
                 })}
+                {!isSaved && (
+                  <button
+                    type="button"
+                    onClick={() => setShowTagPicker(v => !v)}
+                    className={`inline-flex items-center justify-center w-5 h-5 rounded-full text-xs font-medium border transition-colors ${showTagPicker ? 'bg-blue-100 border-blue-300 text-blue-600' : 'border-gray-300 text-gray-400 hover:text-blue-500 hover:border-blue-300'}`}
+                    title="Add tag"
+                  >
+                    +
+                  </button>
+                )}
               </div>
+
+              {showTagPicker && (
+                <>
+                  <button
+                    type="button"
+                    className="fixed inset-0 z-10 cursor-default"
+                    onClick={() => { setShowTagPicker(false); setTagSearch('') }}
+                    aria-label="Close tag picker"
+                  />
+                  <div className="absolute left-0 top-full mt-1 z-20 w-56 bg-white border border-gray-200 rounded-lg shadow-lg overflow-hidden">
+                    <input
+                      autoFocus
+                      className="w-full text-xs border-b border-gray-200 px-2 py-1.5 focus:outline-none"
+                      placeholder="Search tags…"
+                      value={tagSearch}
+                      onChange={e => setTagSearch(e.target.value)}
+                    />
+                    <div className="max-h-40 overflow-y-auto">
+                      {pickerOptions.length === 0 && (
+                        <p className="text-xs text-gray-400 text-center py-2">No matching tags</p>
+                      )}
+                      {pickerOptions.map(t => (
+                        <button
+                          key={t.id}
+                          type="button"
+                          onClick={() => addTag(t.name)}
+                          className="w-full text-left px-2 py-1.5 hover:bg-gray-50 transition-colors"
+                        >
+                          <div className="text-xs text-gray-800 truncate">
+                            {t.name}
+                            {t.display_name && (
+                              <span className="ml-1.5 text-[11px] text-gray-400">{t.display_name}</span>
+                            )}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           )
         }

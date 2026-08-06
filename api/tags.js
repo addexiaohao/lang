@@ -19,14 +19,29 @@ export default async function handler(req, res) {
       throw e
     }
 
-    const { data, error } = await supabase
-      .from('tags')
-      .select('id, name, display_name, description')
-      .eq('project_id', project_id)
-      .order('name', { ascending: true })
+    const [{ data, error }, { data: cards, error: cardsError }] = await Promise.all([
+      supabase
+        .from('tags')
+        .select('id, name, display_name, description')
+        .eq('project_id', project_id)
+        .order('name', { ascending: true }),
+      supabase
+        .from('knowledge_cards')
+        .select('tags')
+        .eq('project_id', project_id),
+    ])
 
     if (error) return res.status(500).json({ error: error.message })
-    return res.status(200).json(data)
+    if (cardsError) return res.status(500).json({ error: cardsError.message })
+
+    const counts = {}
+    for (const card of cards) {
+      for (const tag of card.tags ?? []) {
+        counts[tag] = (counts[tag] ?? 0) + 1
+      }
+    }
+
+    return res.status(200).json(data.map(t => ({ ...t, card_count: counts[t.name] ?? 0 })))
   }
 
   if (req.method === 'POST') {

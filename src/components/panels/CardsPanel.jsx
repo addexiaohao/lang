@@ -171,9 +171,21 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDrag
                 {card.tags?.length > 3 && (
                   <span className="text-[10px] text-gray-400">+{card.tags.length - 3}</span>
                 )}
-                {card.skill != null && (
-                  <span className="ml-auto text-[10px] text-gray-400 shrink-0">{card.skill}/10</span>
-                )}
+                <span className="ml-auto flex items-center gap-2 shrink-0">
+                  <span title="Linked sources" className="flex items-center gap-0.5 text-[10px] text-gray-400">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-2.5 h-2.5">
+                      <path d="M10 13a5 5 0 007.07 0l1.93-1.93a5 5 0 00-7.07-7.07L10.5 5.5" />
+                      <path d="M14 11a5 5 0 00-7.07 0l-1.93 1.93a5 5 0 007.07 7.07L13.5 18.5" />
+                    </svg>
+                    {card.link_count ?? 0}
+                  </span>
+                  {card.importance != null && (
+                    <span title="Importance" className="text-[10px] text-gray-400">★ {card.importance}</span>
+                  )}
+                  {card.skill != null && (
+                    <span className="text-[10px] text-gray-400">{card.skill}/10</span>
+                  )}
+                </span>
               </div>
             </button>
           )

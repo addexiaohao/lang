@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
 import { getProjectConfig } from '../lib/projectConfig.js'
+import { findDuplicateSource } from '../lib/normalizeSourceText.js'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
@@ -181,7 +182,7 @@ Rules:
 
 ## Before saving sources
 
-Call \`search_sources\` with the exact \`original_text\` before emitting any \`save:source\` block.
+Call \`search_sources\` with the \`original_text\` before emitting any \`save:source\` block.
 - No match → emit \`save:source\` as normal.
 - Match → emit \`save:source\` with \`"existing_id"\` set to the matched source's id.
 
@@ -232,7 +233,7 @@ const tools = [
     input_schema: {
       type: 'object',
       properties: {
-        original_text: { type: 'string', description: 'The exact original text to check for duplicates' },
+        original_text: { type: 'string', description: 'The original text to check for duplicates (matching ignores case, punctuation, and whitespace differences)' },
       },
       required: ['original_text'],
     },
@@ -316,10 +317,10 @@ export default async function handler(req, res) {
     const { data, error } = await supabase
       .from('sources')
       .select('id, original_text')
-      .eq('original_text', originalText)
       .eq('project_id', project_id)
-      .limit(1)
-    return error ? [] : data
+    if (error) return []
+    const match = findDuplicateSource(data ?? [], originalText)
+    return match ? [match] : []
   }
 
   async function executeSearchKnowledgeCards(query) {
