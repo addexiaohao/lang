@@ -12,7 +12,7 @@ const TABLE_LABELS = {
   knowledge_card: 'Knowledge Card',
 }
 
-const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState = { status: 'idle' }, blocked = false, validationWarnings = [], unknownFields = [], contexts, sourceText, tagCatalog = [], proposedTagMeta = {}, linkState, onLink, annotatedSentence, onAnnotatedSentenceChange }, ref) {
+const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState = { status: 'idle' }, blocked = false, validationWarnings = [], unknownFields = [], contexts, forcedContext = null, sourceText, tagCatalog = [], proposedTagMeta = {}, linkState, onLink, annotatedSentence, onAnnotatedSentenceChange }, ref) {
   const { activeProject } = useProject()
   const { ttsLocale, contextsRequired } = getProjectConfig(activeProject ?? {})
   const [fields, setFields] = useState(() => {
@@ -24,7 +24,7 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
           typeof v === 'object' && v !== null ? JSON.stringify(v, null, 2) : String(v ?? ''),
         ])
     )
-    return table === 'source' ? { context_id: '', ...base } : base
+    return table === 'source' ? { context_id: forcedContext?.id ?? '', ...base } : base
   })
 
   // Tags are managed separately from fields for knowledge_card
@@ -304,16 +304,25 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
           <div key={key}>
             <label className={`block text-xs mb-0.5 ${unknownFieldSet.has(key) ? 'text-amber-500' : 'text-gray-500'}`}>{key}</label>
             {key === 'context_id' ? (
-              <select
-                value={value}
-                onChange={e => update('context_id', e.target.value)}
-                className="w-full text-xs border border-gray-200 rounded px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
-              >
-                <option value="">Select context…</option>
-                {(contexts ?? []).map(ctx => (
-                  <option key={ctx.id} value={ctx.id}>{ctx.name}</option>
-                ))}
-              </select>
+              forcedContext ? (
+                <div
+                  className="w-full text-xs border border-gray-200 rounded px-2 py-1 bg-gray-100 text-gray-500"
+                  title="This chat only ever saves sources under the generated context"
+                >
+                  {forcedContext.name}
+                </div>
+              ) : (
+                <select
+                  value={value}
+                  onChange={e => update('context_id', e.target.value)}
+                  className="w-full text-xs border border-gray-200 rounded px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
+                >
+                  <option value="">Select context…</option>
+                  {(contexts ?? []).map(ctx => (
+                    <option key={ctx.id} value={ctx.id}>{ctx.name}</option>
+                  ))}
+                </select>
+              )
             ) : rangeFields.has(key) ? (
               <div className="flex items-center gap-2">
                 <input

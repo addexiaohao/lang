@@ -1,44 +1,62 @@
-// Prompt regression tests — German project.
-// Requires the dev server with the German project active: vercel dev
+// Prompt regression tests — German project. Calls the real Anthropic API directly with a fixed
+// project fixture (tests/fixtures/projects.js) — no Supabase, no vercel dev server required.
 //
 // Philosophy:
 //   - Format violations always fail (malformed JSON, missing required fields, bad enum/range).
 //   - Content assertions are CONDITIONAL: if a card is present it must be correct,
 //     but tests never fail because a card wasn't emitted — that's a judgment call.
 
-import 'dotenv/config'
-process.env.TEST_PROJECT_ID = process.env.TEST_PROJECT_ID_DE
-import { runChat } from '../helpers/run-chat.js'
-import { parseBlocks } from '../helpers/parse-blocks.js'
+import { makeAnthropic } from '../helpers/anthropic-client.js'
+import { runPromptCases } from '../helpers/prompt-suite.js'
+import { GERMAN_PROJECT } from '../fixtures/projects.js'
 import {
-  assertNoParseErrors,
-  assertValidFormat,
   findCards,
   mustHaveTags,
   mustNotHaveTags,
   mustBeKind,
   mustBeAbsent,
-  AssertionError,
 } from '../helpers/assert.js'
+
+// The real system_prompt (see fixtures/projects.js) splits every preposition into two cards:
+// one vocabulary card for the bare lemma, and one grammar/"production" card per (lemma +
+// use-case) pair, identified by a specific function tag — not by name, since production-card
+// names are free text ("nach + place name"). Find by tag for that reason.
+function findCardsByTag(blocks, tag) {
+  return blocks
+    .filter(b => b.type === 'knowledge_card' && b.parsed)
+    .map(b => b.parsed)
+    .filter(c => (c.tags ?? []).includes(tag))
+}
 
 const cases = [
   {
     name: 'Christmas holidays sentence',
     input: 'In den Weihnachtsferien zogen wir nach Florida',
     assertions(blocks) {
-      // ziehen is a strong verb: irregular simple-past (zog) and past-participle (gezogen)
+      // ziehen is a strong verb; the sentence only uses the simple-past form (zogen), so only
+      // assert the tag for the form actually evidenced in the example — the model tags what it
+      // sees in context, not a full irregularity paradigm pulled from general knowledge, and
+      // that's the behavior we want (don't assert grammatical facts beyond the given text).
       for (const card of findCards(blocks, /^ziehen$/i)) {
-        mustHaveTags(card, ['irregular-simple-past', 'irregular-past-participle'])
+        mustHaveTags(card, ['verb-irregular-simple-past'])
       }
 
       // Weihnachtsferien is plural-only — no gender tag
       for (const card of findCards(blocks, /weihnachtsferien/i)) {
-        mustNotHaveTags(card, ['fem', 'masc', 'neut'])
+        mustNotHaveTags(card, ['noun-feminine', 'noun-masculine', 'noun-neuter'])
       }
 
-      // nach used as directional preposition → should be saved as a usage-pattern grammar card
-      for (const card of findCards(blocks, /^nach\b/i)) {
+      // "nach" the bare lemma is a vocabulary card (system prompt's PREPOSITIONS rule 1)
+      for (const card of findCards(blocks, /^nach$/i)) {
+        mustBeKind(card, 'vocabulary')
+        mustHaveTags(card, ['preposition'])
+      }
+
+      // "nach Florida" (destination) is a separate production/grammar card, found by its
+      // function tag rather than its exact wording (system prompt's PREPOSITIONS rule 2)
+      for (const card of findCardsByTag(blocks, 'production-which-preposition-destination')) {
         mustBeKind(card, 'grammar')
+        mustHaveTags(card, ['production', 'production-which-preposition'])
       }
 
       // compound noun — only its roots (Weihnachten, Ferien) should be saved, not the compound itself
@@ -60,34 +78,5 @@ const cases = [
   // },
 ]
 
-// ── Runner ────────────────────────────────────────────────────────────────────
-
-let passed = 0
-let failed = 0
-
-for (const tc of cases) {
-  process.stdout.write(`  ${tc.name} ... `)
-  try {
-    const text = await runChat(tc.input)
-    const blocks = parseBlocks(text)
-    assertNoParseErrors(blocks)
-    assertValidFormat(blocks)
-    tc.assertions(blocks)
-    console.log('PASS')
-    passed++
-  } catch (e) {
-    if (e instanceof AssertionError) {
-      console.log(`FAIL\n    ${e.message}`)
-      if (e.context) {
-        const ctx = JSON.stringify(e.context, null, 2).replace(/\n/g, '\n      ')
-        console.log(`      ${ctx}`)
-      }
-    } else {
-      console.log(`ERROR\n    ${e.message}`)
-    }
-    failed++
-  }
-}
-
-console.log(`\n${passed} passed, ${failed} failed`)
-if (failed > 0) process.exit(1)
+const anthropic = makeAnthropic()
+await runPromptCases({ anthropic, project: GERMAN_PROJECT, cases })

@@ -49,8 +49,11 @@ export default async function handler(req, res) {
     if (!annotated_sentence) {
       return res.status(400).json({ error: 'annotated_sentence is required' })
     }
+    if (!(await belongsToProject('knowledge_cards', knowledge_card_id, project_id))) {
+      return res.status(404).json({ error: 'Knowledge card not found' })
+    }
 
-    const positions = await resolveLink(source_id, annotated_sentence, res)
+    const positions = await resolveLink(source_id, project_id, annotated_sentence, res)
     if (!positions) return
 
     const { data, error } = await supabase
@@ -72,7 +75,7 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: 'annotated_sentence is required' })
     }
 
-    const positions = await resolveLink(source_id, annotated_sentence, res)
+    const positions = await resolveLink(source_id, project_id, annotated_sentence, res)
     if (!positions) return
 
     const card = { ...cardFields, project_id }
@@ -104,6 +107,9 @@ export default async function handler(req, res) {
     const { table_id, axis_values, skill } = record
     if (!table_id) return res.status(400).json({ error: 'table_id is required' })
     if (!axis_values || typeof axis_values !== 'object') return res.status(400).json({ error: 'axis_values is required' })
+    if (!(await belongsToProject('tables', table_id, project_id))) {
+      return res.status(404).json({ error: 'Table not found' })
+    }
     const cell_key = deriveCellKey(axis_values)
     const row = { table_id, cell_key, axis_values, ...(skill != null ? { skill } : {}) }
     const { data, error } = await supabase
@@ -118,6 +124,16 @@ export default async function handler(req, res) {
   if (table === 'link_table_cell') {
     const { source_id, table_cell_id, excerpt, note } = record
     if (!source_id || !table_cell_id) return res.status(400).json({ error: 'source_id and table_cell_id are required' })
+    if (!(await belongsToProject('sources', source_id, project_id))) {
+      return res.status(404).json({ error: 'Source not found' })
+    }
+    const { data: cell, error: cellErr } = await supabase
+      .from('table_cells')
+      .select('id, tables!inner(project_id)')
+      .eq('id', table_cell_id)
+      .eq('tables.project_id', project_id)
+      .single()
+    if (cellErr || !cell) return res.status(404).json({ error: 'Table cell not found' })
     const { data, error } = await supabase
       .from('source_table_cells')
       .insert({ source_id, table_cell_id, excerpt: excerpt || null, note: note || null })
@@ -139,13 +155,14 @@ function deriveCellKey(axisValues) {
     .join('-')
 }
 
-// Fetches original_text for source_id, resolves annotated_sentence to positions.
-// Returns positions array on success, or sends a 422 response and returns null.
-async function resolveLink(source_id, annotated_sentence, res) {
+// Fetches original_text for source_id (scoped to project_id), resolves annotated_sentence to
+// positions. Returns positions array on success, or sends a 404/422 response and returns null.
+async function resolveLink(source_id, project_id, annotated_sentence, res) {
   const { data: source, error: srcErr } = await supabase
     .from('sources')
     .select('original_text')
     .eq('id', source_id)
+    .eq('project_id', project_id)
     .single()
 
   if (srcErr || !source) {
@@ -159,4 +176,17 @@ async function resolveLink(source_id, annotated_sentence, res) {
     res.status(422).json({ error: `Position resolution failed: ${e.message}` })
     return null
   }
+}
+
+// Checks that a row with the given id exists in `tableName` (one with its own project_id
+// column) scoped to project_id. table_cells has no project_id of its own — its ownership check
+// is inlined above via a join through its parent `tables` row instead.
+async function belongsToProject(tableName, id, project_id) {
+  const { data, error } = await supabase
+    .from(tableName)
+    .select('id')
+    .eq('id', id)
+    .eq('project_id', project_id)
+    .single()
+  return !error && !!data
 }

@@ -175,7 +175,7 @@ function parseFieldsToRecord(fields, originalRecord) {
   )
 }
 
-export default function ChatMessage({ role, content, sourceRefMap = {}, onSourceRegistered, onSourceSaved, contexts = [], tagCatalog = [], onNewTags, projectId }) {
+export default function ChatMessage({ role, content, sourceRefMap = {}, onSourceRegistered, onSourceSaved, contexts = [], forcedContext = null, tagCatalog = [], onNewTags, projectId }) {
   const isUser = role === 'user'
   const segments = useMemo(() => isUser ? [] : parseSaveBlocks(content), [content, isUser])
   const blocks = segments.filter(s => s.type === 'block')
@@ -576,6 +576,7 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
                 validationWarnings={segment.validationWarnings ?? []}
                 unknownFields={segment.unknownFields ?? []}
                 contexts={segment.table === 'source' ? contexts : undefined}
+                forcedContext={segment.table === 'source' ? forcedContext : undefined}
                 sourceText={segment.table === 'knowledge_card'
                   ? (segment.sourceRef != null
                       ? sourceRefMap[segment.sourceRef]?.text

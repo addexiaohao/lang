@@ -1,29 +1,43 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useProject } from './ProjectContext.jsx'
 import { apiFetch } from './apiFetch.js'
 import { supabase } from './supabaseClient.js'
 import { Sidebar } from './components/Sidebar.jsx'
-import { ResizeHandle } from './components/ResizeHandle.jsx'
 import { ProjectSwitcher } from './components/ProjectSwitcher.jsx'
+import { SettingsModal } from './components/SettingsModal.jsx'
+import { ChatDock } from './components/ChatDock.jsx'
+import { Overlay } from './components/Overlay.jsx'
 import { ChatPanel } from './components/panels/ChatPanel.jsx'
-import { SourcesPanel } from './components/panels/SourcesPanel.jsx'
-import { SourceDetailPanel } from './components/panels/SourceDetailPanel.jsx'
-import { ContextsPanel } from './components/panels/ContextsPanel.jsx'
-import { TagsPanel } from './components/panels/TagsPanel.jsx'
-import { CardsPanel } from './components/panels/CardsPanel.jsx'
 import { CardDetailPanel } from './components/panels/CardDetailPanel.jsx'
+import { TableDetailPanel } from './components/panels/TableDetailPanel.jsx'
+import { TagsPanel } from './components/panels/TagsPanel.jsx'
+import { LibraryMode, LIBRARY_DEFAULT_WIDTHS } from './components/modes/LibraryMode.jsx'
+import { PracticeMode } from './components/modes/PracticeMode.jsx'
 
-const DEFAULT_WIDTHS = {
-  chat: 560,
-  sources: 300,
-  'source-detail': 360,
-  cards: 340,
-  'card-detail': 360,
-  tags: 340,
-  contexts: 340,
+// Three activity modes replace the old entity-based sidebar (plan.md Part B). Library/Learn/
+// Practice are all mounted here unconditionally and only *hidden* via CSS `display` depending on
+// `mode` — never conditionally rendered with `mode === x && <X/>`. That's what stops a mode
+// switch from resetting anything: the chat conversation, an in-progress practice session, and
+// Library's scroll/filter/selection state all live inside components that simply never unmount.
+const DEFAULT_LIBRARY_LAYOUT = { openPanels: ['cards'], panelWidths: { cards: LIBRARY_DEFAULT_WIDTHS.cards } }
+
+function loadJSON(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key)
+    return raw ? JSON.parse(raw) : fallback
+  } catch {
+    return fallback
+  }
 }
-const MIN_WIDTH = 100
+
+function saveJSON(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value))
+  } catch {
+    // localStorage unavailable (private mode, quota) — layout just won't persist.
+  }
+}
 
 export default function App() {
   const { activeProject, loading: projectsLoading } = useProject()
@@ -31,28 +45,57 @@ export default function App() {
   const [tagCatalog, setTagCatalog] = useState([])
   const navigate = useNavigate()
 
-  const [openPanels, setOpenPanels] = useState(['chat'])
-  const [panelWidths, setPanelWidths] = useState({ chat: DEFAULT_WIDTHS.chat })
+  const [mode, setMode] = useState('learn')
+  const [libraryLayout, setLibraryLayout] = useState(DEFAULT_LIBRARY_LAYOUT)
+
+  // Library's own selection state — lifted here (rather than local to LibraryMode) only so the
+  // card peek overlay's "Open in Library" hand-off can reach into it.
   const [selectedSource, setSelectedSource] = useState(null)
   const [selectedCard, setSelectedCard] = useState(null)
+  const [selectedTable, setSelectedTable] = useState(null)
   const [selectedTag, setSelectedTag] = useState(null)
+
+  // Practice session is deliberately NOT persisted to localStorage — see PracticePanel.jsx's own
+  // "reload and it's gone, by design" comment. Surviving mode switches (via always-mount) is the
+  // whole requirement; surviving a reload isn't.
+  const [practiceSession, setPracticeSession] = useState(null)
+  const [peek, setPeek] = useState(null)
+  const [drawerOpen, setDrawerOpen] = useState(false)
   const [chatInput, setChatInput] = useState('')
-  const [draggingIndex, setDraggingIndex] = useState(null)
-  const [dragOverIndex, setDragOverIndex] = useState(null)
-  const dragRef = useRef({ from: null, to: null })
-  const panelContainerRef = useRef(null)
+  const [showSettings, setShowSettings] = useState(false)
 
   useEffect(() => {
     if (!activeProject) return
     apiFetch(`/api/contexts?project_id=${activeProject.id}`)
       .then(r => r.ok ? r.json() : [])
-      .then(setContexts)
+      .then(async list => {
+        // The "generated" context marks sources whose text the LLM produced itself (Practice's
+        // "Add source" chat), rather than something the user encountered — it's a plain row in
+        // `contexts` like any other, just one the frontend creates on demand and never offers as
+        // a manual pick (filtered out of `pickableContexts` below).
+        if (!list.some(c => c.name === 'generated')) {
+          try {
+            const res = await apiFetch('/api/contexts', {
+              method: 'POST',
+              body: JSON.stringify({ project_id: activeProject.id, name: 'generated' }),
+            })
+            if (res.ok) list = [...list, await res.json()]
+          } catch {
+            // best-effort; the Add-source chat just stays disabled until this succeeds
+          }
+        }
+        setContexts(list)
+      })
       .catch(() => {})
     apiFetch(`/api/tags?project_id=${activeProject.id}&limit=300`)
       .then(r => r.ok ? r.json() : [])
       .then(setTagCatalog)
       .catch(() => {})
   }, [activeProject?.id])
+
+  // The one context users are never allowed to hand-pick — see effect above.
+  const generatedContext = contexts.find(c => c.name === 'generated') ?? null
+  const pickableContexts = contexts.filter(c => c.name !== 'generated')
 
   const refreshTagCatalog = useCallback(() => {
     if (!activeProject) return
@@ -62,310 +105,199 @@ export default function App() {
       .catch(() => {})
   }, [activeProject?.id])
 
+  // Hydrate mode + per-mode layout from localStorage, and clear ephemeral state, on project switch.
+  useEffect(() => {
+    if (!activeProject) return
+    const id = activeProject.id
+    setMode(loadJSON(`lang:mode:${id}`, 'learn'))
+    setLibraryLayout(loadJSON(`lang:layout:library:${id}`, DEFAULT_LIBRARY_LAYOUT))
+    setSelectedSource(null)
+    setSelectedCard(null)
+    setSelectedTable(null)
+    setSelectedTag(null)
+    setPeek(null)
+    setPracticeSession(null)
+    setDrawerOpen(false)
+  }, [activeProject?.id])
+
+  useEffect(() => {
+    if (activeProject) saveJSON(`lang:mode:${activeProject.id}`, mode)
+  }, [mode, activeProject?.id])
+
+  useEffect(() => {
+    if (activeProject) saveJSON(`lang:layout:library:${activeProject.id}`, libraryLayout)
+  }, [libraryLayout, activeProject?.id])
+
   async function handleLogout() {
     await supabase.auth.signOut()
     navigate('/login')
   }
 
-  function togglePanel(id) {
-    setOpenPanels(prev => {
-      if (prev.includes(id)) {
-        if (id === 'sources') {
-          setSelectedSource(null)
-          return prev.filter(p => p !== id && p !== 'source-detail')
-        }
-        if (id === 'cards') {
-          setSelectedCard(null)
-          return prev.filter(p => p !== id && p !== 'card-detail')
-        }
-        if (id === 'tags') {
-          setSelectedTag(null)
-          return prev.filter(p => p !== id)
-        }
-        return prev.filter(p => p !== id)
-      }
-      setPanelWidths(w => ({ ...w, [id]: DEFAULT_WIDTHS[id] ?? 360 }))
-      return [...prev, id]
-    })
+  // The only cross-mode hand-off in the app (plan.md B5): Library's card multi-select + "Practice"
+  // footer, and Practice's own quick-start, both funnel through here.
+  function handleStartPractice(cards, practiceMode) {
+    setPracticeSession({ cards, mode: practiceMode })
+    setMode('practice')
   }
 
-  function handleSelectCard(card) {
+  function handleEndPracticeSession() {
+    setPracticeSession(null)
+  }
+
+  // Reveals chat: already visible in Learn; opens the drawer everywhere else. Used by Practice's
+  // Explain/Why? buttons, the chat FAB, and every panel's "add to chat" action.
+  function revealChat(text) {
+    if (mode !== 'learn') setDrawerOpen(true)
+    if (text) setChatInput(prev => prev ? prev + '\n' + text : text)
+  }
+
+  function openPeekCard(card) { setPeek({ type: 'card', card }) }
+  function openPeekTable(table) { setPeek({ type: 'table', table }) }
+  function openPeekTag(tagName) { setPeek({ type: 'tag', tagName }) }
+  function closePeek() { setPeek(null) }
+
+  // Card peek overlay's "Open in Library" (plan.md B4): switches mode, makes sure Library has the
+  // right panels open, and hands the card to Library's own selection state.
+  function handleOpenPeekInLibrary() {
+    if (peek?.type !== 'card') return
+    const card = peek.card
+    setMode('library')
+    setLibraryLayout(prev => {
+      let openPanels = prev.openPanels
+      if (!openPanels.includes('cards')) openPanels = [...openPanels, 'cards']
+      if (!openPanels.includes('card-detail')) openPanels = [...openPanels, 'card-detail']
+      return { ...prev, openPanels }
+    })
     setSelectedCard(card)
-    setOpenPanels(prev => {
-      if (!prev.includes('card-detail')) {
-        setPanelWidths(w => ({ ...w, 'card-detail': DEFAULT_WIDTHS['card-detail'] }))
-        return [...prev, 'card-detail']
-      }
-      return prev
-    })
-  }
-
-  function handleCloseCardDetail() {
-    setSelectedCard(null)
-    setOpenPanels(prev => prev.filter(p => p !== 'card-detail'))
-  }
-
-  function handleSelectTag(tagName) {
-    setSelectedTag(tagName)
-    if (!tagName) return
-    setOpenPanels(prev => {
-      if (!prev.includes('tags')) {
-        setPanelWidths(w => ({ ...w, tags: DEFAULT_WIDTHS.tags }))
-        return [...prev, 'tags']
-      }
-      return prev
-    })
-  }
-
-  function handleSelectSource(source) {
-    setSelectedSource(source)
-    setOpenPanels(prev => {
-      if (!prev.includes('source-detail')) {
-        setPanelWidths(w => ({ ...w, 'source-detail': DEFAULT_WIDTHS['source-detail'] }))
-        return [...prev, 'source-detail']
-      }
-      return prev
-    })
-  }
-
-  function handleCloseSourceDetail() {
-    setSelectedSource(null)
-    setOpenPanels(prev => prev.filter(p => p !== 'source-detail'))
-  }
-
-  function handleAppendToChat(text) {
-    setOpenPanels(prev => {
-      if (prev.includes('chat')) return prev
-      setPanelWidths(w => ({ ...w, chat: DEFAULT_WIDTHS.chat }))
-      return ['chat', ...prev]
-    })
-    setChatInput(prev => prev ? prev + '\n' + text : text)
-  }
-
-  function handlePanelDragStart(index, e) {
-    e.preventDefault()
-    setDraggingIndex(index)
-    setDragOverIndex(index)
-    dragRef.current = { from: index, to: index }
-
-    function onMouseUp() {
-      document.removeEventListener('mouseup', onMouseUp)
-      const { from, to } = dragRef.current
-      setDraggingIndex(null)
-      setDragOverIndex(null)
-      if (from !== to) {
-        setOpenPanels(prev => {
-          const next = [...prev]
-          const [item] = next.splice(from, 1)
-          next.splice(to, 0, item)
-          return next
-        })
-      }
-    }
-
-    document.addEventListener('mouseup', onMouseUp)
-  }
-
-  function handleDragOver(index) {
-    setDragOverIndex(index)
-    dragRef.current.to = index
-  }
-
-  useEffect(() => {
-    if (draggingIndex != null) {
-      document.body.style.cursor = 'grabbing'
-      document.body.style.userSelect = 'none'
-    } else {
-      document.body.style.cursor = ''
-      document.body.style.userSelect = ''
-    }
-    return () => {
-      document.body.style.cursor = ''
-      document.body.style.userSelect = ''
-    }
-  }, [draggingIndex])
-
-  function handleResize(leftId, rightId, dx) {
-    setPanelWidths(prev => {
-      const leftW = (prev[leftId] ?? DEFAULT_WIDTHS[leftId] ?? 360) + dx
-      if (leftW < MIN_WIDTH) return prev
-      const rightIsLast = openPanels[openPanels.length - 1] === rightId
-      if (rightIsLast) {
-        const containerW = panelContainerRef.current?.offsetWidth ?? 0
-        const handleTotalW = (openPanels.length - 1) * 4
-        const nonLastTotalW = openPanels.slice(0, -1).reduce((sum, id) => {
-          return sum + (id === leftId ? leftW : (prev[id] ?? DEFAULT_WIDTHS[id] ?? 360))
-        }, 0)
-        if (containerW - nonLastTotalW - handleTotalW < MIN_WIDTH) return prev
-        return { ...prev, [leftId]: leftW }
-      }
-      const rightW = (prev[rightId] ?? DEFAULT_WIDTHS[rightId] ?? 360) - dx
-      if (rightW < MIN_WIDTH) return prev
-      return { ...prev, [leftId]: leftW, [rightId]: rightW }
-    })
+    setPeek(null)
   }
 
   if (projectsLoading) return null
 
-  // Build interleaved [panel, handle, panel, handle, panel] list
-  const panelElements = []
-  openPanels.forEach((panelId, i) => {
-    const width = panelWidths[panelId] ?? DEFAULT_WIDTHS[panelId] ?? 360
-    const isDragging = draggingIndex === i
-    const isDropTarget = draggingIndex != null && dragOverIndex === i && dragOverIndex !== draggingIndex
-
-    if (i > 0) {
-      panelElements.push(
-        <ResizeHandle
-          key={`resize-${i}`}
-          onDrag={dx => handleResize(openPanels[i - 1], panelId, dx)}
-        />
-      )
-    }
-
-    const isLast = i === openPanels.length - 1
-    const onDragStart = (e) => handlePanelDragStart(i, e)
-    const onClose = panelId === 'source-detail' ? handleCloseSourceDetail : () => togglePanel(panelId)
-
-    panelElements.push(
-      <div
-        key={panelId}
-        className={`relative overflow-hidden ${isLast ? 'flex-1' : 'border-r border-gray-200 shrink-0'} ${isDragging ? 'opacity-50' : ''}`}
-        style={isLast ? { minWidth: MIN_WIDTH } : { width, minWidth: MIN_WIDTH }}
-        onMouseEnter={() => draggingIndex != null && draggingIndex !== i && handleDragOver(i)}
-      >
-        {isDropTarget && (
-          <div className="absolute inset-y-0 left-0 w-0.5 bg-blue-500 z-20 pointer-events-none" />
-        )}
-        {renderPanel(panelId, {
-          activeProject,
-          contexts,
-          setContexts,
-          tagCatalog,
-          onNewTags: refreshTagCatalog,
-          selectedSource,
-          onSelectSource: handleSelectSource,
-          onCloseSourceDetail: handleCloseSourceDetail,
-          selectedCard,
-          onSelectCard: handleSelectCard,
-          onCloseCardDetail: handleCloseCardDetail,
-          selectedTag,
-          onSelectTag: handleSelectTag,
-          chatInput,
-          onChatInputChange: setChatInput,
-          onAppendToChat: handleAppendToChat,
-          onDragStart,
-          onClose,
-        })}
-      </div>
-    )
-  })
-
   return (
     <div className="flex h-screen overflow-hidden">
       <Sidebar
-        openPanels={openPanels}
-        onToggle={togglePanel}
+        mode={mode}
+        onModeChange={setMode}
+        onOpenSettings={() => setShowSettings(true)}
         onLogout={handleLogout}
         header={<ProjectSwitcher />}
       />
-      <div ref={panelContainerRef} className="flex flex-1 overflow-hidden">
-        {panelElements}
+
+      <div className="flex flex-1 overflow-hidden relative">
+        <div style={{ display: mode === 'library' ? 'flex' : 'none' }} className="flex-1 min-w-0 h-full overflow-hidden">
+          <LibraryMode
+            activeProject={activeProject}
+            contexts={contexts}
+            setContexts={setContexts}
+            tagCatalog={tagCatalog}
+            onNewTags={refreshTagCatalog}
+            layout={libraryLayout}
+            onLayoutChange={setLibraryLayout}
+            selectedSource={selectedSource} setSelectedSource={setSelectedSource}
+            selectedCard={selectedCard} setSelectedCard={setSelectedCard}
+            selectedTable={selectedTable} setSelectedTable={setSelectedTable}
+            selectedTag={selectedTag} setSelectedTag={setSelectedTag}
+            onAppendToChat={revealChat}
+            onStartPractice={handleStartPractice}
+          />
+        </div>
+
+        <div style={{ display: mode === 'practice' ? 'flex' : 'none' }} className="flex-1 h-full overflow-hidden">
+          <PracticeMode
+            activeProject={activeProject}
+            practiceSession={practiceSession}
+            onStartPractice={handleStartPractice}
+            onEndSession={handleEndPracticeSession}
+            onSelectCard={openPeekCard}
+            onSelectTable={openPeekTable}
+            peekCardId={peek?.type === 'card' ? peek.card.id : null}
+            peekTableId={peek?.type === 'table' ? peek.table.id : null}
+            generatedContext={generatedContext}
+            tagCatalog={tagCatalog}
+            onNewTags={refreshTagCatalog}
+          />
+        </div>
+
+        <ChatDock
+          variant={mode === 'learn' ? 'column' : 'drawer'}
+          open={drawerOpen}
+          onBackdropClick={() => setDrawerOpen(false)}
+        >
+          <ChatPanel
+            activeProject={activeProject}
+            contexts={pickableContexts}
+            tagCatalog={tagCatalog}
+            onNewTags={refreshTagCatalog}
+            input={chatInput}
+            onInputChange={setChatInput}
+            onClose={mode === 'learn' ? undefined : () => setDrawerOpen(false)}
+          />
+        </ChatDock>
+
+        {mode !== 'learn' && (
+          <button
+            onClick={() => setDrawerOpen(o => !o)}
+            aria-label="Toggle chat"
+            title="Chat"
+            className={`fixed bottom-6 right-6 z-30 w-12 h-12 rounded-full bg-blue-600 text-white shadow-lg flex items-center justify-center hover:bg-blue-700 transition-transform ${
+              drawerOpen ? 'scale-0' : 'scale-100'
+            }`}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="w-5 h-5">
+              <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
+            </svg>
+          </button>
+        )}
+
+        <Overlay
+          open={peek != null}
+          onClose={closePeek}
+          headerExtra={peek?.type === 'card' ? (
+            <button
+              onClick={handleOpenPeekInLibrary}
+              className="text-xs font-medium text-blue-600 hover:text-blue-800 transition-colors"
+            >
+              Open in Library
+            </button>
+          ) : null}
+        >
+          {peek?.type === 'card' && (
+            <CardDetailPanel
+              card={peek.card}
+              activeProject={activeProject}
+              onClose={closePeek}
+              onAppendToChat={revealChat}
+              onSelectTag={openPeekTag}
+            />
+          )}
+          {peek?.type === 'table' && (
+            <TableDetailPanel
+              table={peek.table}
+              activeProject={activeProject}
+              onClose={closePeek}
+              onAppendToChat={revealChat}
+              onSelectTag={openPeekTag}
+            />
+          )}
+          {peek?.type === 'tag' && (
+            <TagsPanel
+              activeProject={activeProject}
+              tagCatalog={tagCatalog}
+              onNewTags={refreshTagCatalog}
+              onClose={closePeek}
+              selectedTag={peek.tagName}
+              onSelectTag={openPeekTag}
+              onSelectCard={openPeekCard}
+              selectedCardId={null}
+            />
+          )}
+        </Overlay>
+
+        {showSettings && activeProject && (
+          <SettingsModal project={activeProject} onClose={() => setShowSettings(false)} />
+        )}
       </div>
     </div>
   )
-}
-
-function renderPanel(id, props) {
-  const {
-    activeProject, contexts, setContexts, tagCatalog, onNewTags,
-    selectedSource, onSelectSource,
-    selectedCard, onSelectCard, onCloseCardDetail,
-    selectedTag, onSelectTag,
-    chatInput, onChatInputChange, onAppendToChat, onDragStart, onClose,
-  } = props
-
-  switch (id) {
-    case 'chat':
-      return (
-        <ChatPanel
-          activeProject={activeProject}
-          contexts={contexts}
-          tagCatalog={tagCatalog}
-          onNewTags={onNewTags}
-          input={chatInput}
-          onInputChange={onChatInputChange}
-          onDragStart={onDragStart}
-          onClose={onClose}
-        />
-      )
-    case 'sources':
-      return (
-        <SourcesPanel
-          activeProject={activeProject}
-          onSelectSource={onSelectSource}
-          selectedSourceId={selectedSource?.id}
-          onAppendToChat={onAppendToChat}
-          onDragStart={onDragStart}
-          onClose={onClose}
-        />
-      )
-    case 'source-detail':
-      return (
-        <SourceDetailPanel
-          source={selectedSource}
-          activeProject={activeProject}
-          onClose={onClose}
-          onAppendToChat={onAppendToChat}
-          onDragStart={onDragStart}
-        />
-      )
-    case 'cards':
-      return (
-        <CardsPanel
-          activeProject={activeProject}
-          onSelectCard={onSelectCard}
-          selectedCardId={selectedCard?.id}
-          onDragStart={onDragStart}
-          onClose={onClose}
-        />
-      )
-    case 'card-detail':
-      return (
-        <CardDetailPanel
-          card={selectedCard}
-          activeProject={activeProject}
-          onClose={onCloseCardDetail}
-          onAppendToChat={onAppendToChat}
-          onDragStart={onDragStart}
-          onSelectTag={onSelectTag}
-        />
-      )
-    case 'tags':
-      return (
-        <TagsPanel
-          activeProject={activeProject}
-          tagCatalog={tagCatalog}
-          onNewTags={onNewTags}
-          onDragStart={onDragStart}
-          onClose={onClose}
-          selectedTag={selectedTag}
-          onSelectTag={onSelectTag}
-          onSelectCard={onSelectCard}
-          selectedCardId={selectedCard?.id}
-        />
-      )
-    case 'contexts':
-      return (
-        <ContextsPanel
-          activeProject={activeProject}
-          contexts={contexts}
-          setContexts={setContexts}
-          onDragStart={onDragStart}
-          onClose={onClose}
-        />
-      )
-    default:
-      return null
-  }
 }

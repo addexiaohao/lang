@@ -8,7 +8,9 @@
     "preview": "vite preview",
     "migrate": "node scripts/migrate.js",
     "test:prompt:de": "node tests/german/prompt.test.js",
-    "test:prompt:sv": "node tests/swedish/prompt.test.js"
+    "test:prompt:sv": "node tests/swedish/prompt.test.js",
+    "test:practice:de": "node tests/german/practice.test.js",
+    "test:practice:sv": "node tests/swedish/practice.test.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.100.1",

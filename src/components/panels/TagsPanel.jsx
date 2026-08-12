@@ -7,7 +7,6 @@ const KIND_COLORS = {
   vocabulary: 'text-blue-600 bg-blue-50',
   grammar: 'text-purple-600 bg-purple-50',
   expression: 'text-green-600 bg-green-50',
-  table: 'text-orange-600 bg-orange-50',
 }
 
 function SkillBar({ skill }) {

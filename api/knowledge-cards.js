@@ -12,7 +12,7 @@ export default async function handler(req, res) {
     throw e
   }
 
-  const { project_id, id, q, tag, kind, limit = '20', offset = '0' } = req.query
+  const { project_id, id, q, tag, kind, sort, limit = '20', offset = '0' } = req.query
   if (!project_id) return res.status(400).json({ error: 'project_id required' })
 
   try {
@@ -65,7 +65,7 @@ export default async function handler(req, res) {
     .from('knowledge_cards')
     .select('id, name, kind, tags, skill, importance, created_at, source_knowledge(count)', { count: 'exact' })
     .eq('project_id', project_id)
-    .order('name', { ascending: true })
+    .order(sort === 'recent' ? 'created_at' : 'name', { ascending: sort !== 'recent' })
     .range(Number(offset), Number(offset) + Number(limit) - 1)
 
   if (q) query = query.ilike('name', `%${q}%`)

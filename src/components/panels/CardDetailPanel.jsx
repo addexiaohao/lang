@@ -35,7 +35,6 @@ const KIND_COLORS = {
   vocabulary: 'bg-green-100 text-green-700',
   grammar: 'bg-purple-100 text-purple-700',
   expression: 'bg-orange-100 text-orange-700',
-  table: 'bg-blue-100 text-blue-700',
 }
 
 export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, onDragStart, onSelectTag }) {
@@ -162,21 +161,6 @@ export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, 
               </div>
             </div>
           </div>
-
-          {/* Table axes */}
-          {detail?.axes?.length > 0 && (
-            <div>
-              <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-2">Axes</p>
-              <div className="space-y-1">
-                {detail.axes.map(axis => (
-                  <div key={axis.name} className="text-xs text-gray-600">
-                    <span className="font-medium">{axis.name}:</span>{' '}
-                    <span className="text-gray-500">{axis.values.join(', ')}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
 
           {/* Linked sources */}
           <div>

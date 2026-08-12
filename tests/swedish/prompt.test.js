@@ -1,23 +1,19 @@
-// Prompt regression tests — Swedish project.
-// Requires the dev server with the Swedish project active: vercel dev
+// Prompt regression tests — Swedish project. Calls the real Anthropic API directly with a fixed
+// project fixture (tests/fixtures/projects.js) — no Supabase, no vercel dev server required.
 //
 // Philosophy:
 //   - Format violations always fail (malformed JSON, missing required fields, bad enum/range).
 //   - Content assertions are CONDITIONAL: if a card is present it must be correct,
 //     but tests never fail because a card wasn't emitted — that's a judgment call.
 
-import 'dotenv/config'
-process.env.TEST_PROJECT_ID = process.env.TEST_PROJECT_ID_SV
-import { runChat } from '../helpers/run-chat.js'
-import { parseBlocks } from '../helpers/parse-blocks.js'
+import { makeAnthropic } from '../helpers/anthropic-client.js'
+import { runPromptCases } from '../helpers/prompt-suite.js'
+import { SWEDISH_PROJECT } from '../fixtures/projects.js'
 import {
-  assertNoParseErrors,
-  assertValidFormat,
   findCards,
   mustHaveTags,
   mustBeKind,
   mustBeAbsent,
-  AssertionError,
 } from '../helpers/assert.js'
 
 const cases = [
@@ -77,34 +73,5 @@ const cases = [
   // },
 ]
 
-// ── Runner ────────────────────────────────────────────────────────────────────
-
-let passed = 0
-let failed = 0
-
-for (const tc of cases) {
-  process.stdout.write(`  ${tc.name} ... `)
-  try {
-    const text = await runChat(tc.input)
-    const blocks = parseBlocks(text)
-    assertNoParseErrors(blocks)
-    assertValidFormat(blocks)
-    tc.assertions(blocks)
-    console.log('PASS')
-    passed++
-  } catch (e) {
-    if (e instanceof AssertionError) {
-      console.log(`FAIL\n    ${e.message}`)
-      if (e.context) {
-        const ctx = JSON.stringify(e.context, null, 2).replace(/\n/g, '\n      ')
-        console.log(`      ${ctx}`)
-      }
-    } else {
-      console.log(`ERROR\n    ${e.message}`)
-    }
-    failed++
-  }
-}
-
-console.log(`\n${passed} passed, ${failed} failed`)
-if (failed > 0) process.exit(1)
+const anthropic = makeAnthropic()
+await runPromptCases({ anthropic, project: SWEDISH_PROJECT, cases })

@@ -22,7 +22,7 @@ export default async function handler(req, res) {
     throw e
   }
 
-  // Single-source detail fetch — unchanged
+  // Single-source detail fetch
   if (id) {
     const { data, error } = await supabase
       .from('sources')
@@ -32,6 +32,10 @@ export default async function handler(req, res) {
         source_knowledge(
           positions,
           knowledge_cards(id, name, kind, tags, skill, importance)
+        ),
+        source_table_cells(
+          excerpt, note,
+          table_cells(id, cell_key, axis_values, skill, tables(id, name))
         )
       `)
       .eq('project_id', project_id)
