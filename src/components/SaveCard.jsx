@@ -12,7 +12,7 @@ const TABLE_LABELS = {
   knowledge_card: 'Knowledge Card',
 }
 
-const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState = { status: 'idle' }, blocked = false, validationWarnings = [], unknownFields = [], contexts, forcedContext = null, sourceText, tagCatalog = [], proposedTagMeta = {}, linkState, onLink, annotatedSentence, onAnnotatedSentenceChange }, ref) {
+const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState = { status: 'idle' }, blocked = false, validationWarnings = [], unknownFields = [], contexts, forcedContext = null, sourceText, tagCatalog = [], proposedTagMeta = {}, onAddNewTag, linkState, onLink, annotatedSentence, onAnnotatedSentenceChange }, ref) {
   const { activeProject } = useProject()
   const { ttsLocale, contextsRequired } = getProjectConfig(activeProject ?? {})
   const [fields, setFields] = useState(() => {
@@ -40,7 +40,12 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
   const complexFields = new Set(
     Object.keys(record).filter(k => typeof record[k] === 'object' && record[k] !== null && k !== 'new_tags')
   )
-  const rangeFields = new Set(['skill', 'importance'])
+  // A paradigm card's proposed axes must be inspectable as the grid they'll produce, not raw
+  // JSON — this is the one irreversible choice in the save flow (axes are immutable once saved).
+  const proposedAxes = Array.isArray(record.details?.axes) && record.details.axes.length > 0
+    ? record.details.axes
+    : null
+  const rangeFields = new Set(['importance'])
   const unknownFieldSet = new Set(unknownFields)
   const catalogSet = new Set(tagCatalog.map(t => t.name))
   const catalogMap = new Map(tagCatalog.map(t => [t.name, t]))
@@ -95,6 +100,11 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
     setTagList(prev => prev.includes(tag) ? prev : [...prev, tag])
     setShowTagPicker(false)
     setTagSearch('')
+  }
+
+  function addNewTag(name) {
+    addTag(name)
+    onAddNewTag?.(name)
   }
 
   async function handleSaveClick() {
@@ -226,6 +236,11 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
             })
             .sort((a, b) => a.name.localeCompare(b.name))
 
+          const trimmedQuery = tagSearch.trim()
+          const canAddNewTag = trimmedQuery.length > 0
+            && !tagList.some(t => t.toLowerCase() === trimmedQuery.toLowerCase())
+            && !tagCatalog.some(t => t.name.toLowerCase() === trimmedQuery.toLowerCase())
+
           return (
             <div key={key} className="relative">
               <label className="block text-xs mb-1 text-gray-500">tags</label>
@@ -273,8 +288,17 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
                       value={tagSearch}
                       onChange={e => setTagSearch(e.target.value)}
                     />
+                    {canAddNewTag && (
+                      <button
+                        type="button"
+                        onClick={() => addNewTag(trimmedQuery)}
+                        className="w-full text-left px-2 py-1.5 hover:bg-amber-50 transition-colors border-b border-gray-100"
+                      >
+                        <span className="text-xs font-medium text-amber-700">+ Add new tag "{trimmedQuery}"</span>
+                      </button>
+                    )}
                     <div className="max-h-40 overflow-y-auto">
-                      {pickerOptions.length === 0 && (
+                      {pickerOptions.length === 0 && !canAddNewTag && (
                         <p className="text-xs text-gray-400 text-center py-2">No matching tags</p>
                       )}
                       {pickerOptions.map(t => (
@@ -334,6 +358,25 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
                   className="flex-1 accent-blue-500"
                 />
                 <span className="text-xs font-mono w-4 text-center">{value || 1}</span>
+              </div>
+            ) : key === 'details' && proposedAxes ? (
+              <div className="rounded-md bg-white border border-gray-200 px-2 py-1.5 space-y-1.5">
+                <p className="text-xs font-mono text-gray-700">
+                  {proposedAxes.map(a => a.name).join(' × ')}
+                  {' → '}
+                  {proposedAxes.map(a => a.values?.length ?? 0).join(' × ')}
+                  {' = '}
+                  {proposedAxes.reduce((acc, a) => acc * (a.values?.length ?? 0), 1)} cells
+                </p>
+                {proposedAxes.map(a => (
+                  <div key={a.name} className="flex flex-wrap items-center gap-1">
+                    <span className="text-[10px] text-gray-400 shrink-0">{a.name}:</span>
+                    {(a.values ?? []).map(v => (
+                      <span key={v} className="text-[10px] bg-purple-100 text-purple-700 rounded px-1.5 py-0.5">{v}</span>
+                    ))}
+                  </div>
+                ))}
+                <p className="text-[10px] text-amber-600">Axes are immutable once this card is saved.</p>
               </div>
             ) : complexFields.has(key) ? (
               <textarea

@@ -4,7 +4,6 @@ import { SourcesPanel } from '../panels/SourcesPanel.jsx'
 import { SourceDetailPanel } from '../panels/SourceDetailPanel.jsx'
 import { CardsPanel } from '../panels/CardsPanel.jsx'
 import { CardDetailPanel } from '../panels/CardDetailPanel.jsx'
-import { TableDetailPanel } from '../panels/TableDetailPanel.jsx'
 import { TagsPanel } from '../panels/TagsPanel.jsx'
 import { ContextsPanel } from '../panels/ContextsPanel.jsx'
 
@@ -17,7 +16,6 @@ export const LIBRARY_DEFAULT_WIDTHS = {
   'source-detail': 360,
   cards: 340,
   'card-detail': 360,
-  'table-detail': 420,
   tags: 340,
   contexts: 340,
 }
@@ -73,7 +71,6 @@ export function LibraryMode({
   layout, onLayoutChange,
   selectedSource, setSelectedSource,
   selectedCard, setSelectedCard,
-  selectedTable, setSelectedTable,
   selectedTag, setSelectedTag,
   onAppendToChat, onStartPractice,
 }) {
@@ -106,8 +103,7 @@ export function LibraryMode({
         }
         if (id === 'cards') {
           setSelectedCard(null)
-          setSelectedTable(null)
-          return prev.filter(p => p !== id && p !== 'card-detail' && p !== 'table-detail')
+          return prev.filter(p => p !== id && p !== 'card-detail')
         }
         if (id === 'tags') {
           setSelectedTag(null)
@@ -134,22 +130,6 @@ export function LibraryMode({
   function handleCloseCardDetail() {
     setSelectedCard(null)
     setOpenPanels(prev => prev.filter(p => p !== 'card-detail'))
-  }
-
-  function handleSelectTable(table) {
-    setSelectedTable(table)
-    setOpenPanels(prev => {
-      if (!prev.includes('table-detail')) {
-        setPanelWidths(w => ({ ...w, 'table-detail': LIBRARY_DEFAULT_WIDTHS['table-detail'] }))
-        return [...prev, 'table-detail']
-      }
-      return prev
-    })
-  }
-
-  function handleCloseTableDetail() {
-    setSelectedTable(null)
-    setOpenPanels(prev => prev.filter(p => p !== 'table-detail'))
   }
 
   function handleSelectTag(tagName) {
@@ -264,7 +244,6 @@ export function LibraryMode({
             onClose={handleCloseSourceDetail}
             onAppendToChat={onAppendToChat}
             onDragStart={onDragStart}
-            onSelectTable={handleSelectTable}
           />
         )
       case 'cards':
@@ -273,8 +252,6 @@ export function LibraryMode({
             activeProject={activeProject}
             onSelectCard={handleSelectCard}
             selectedCardId={selectedCard?.id}
-            onSelectTable={handleSelectTable}
-            selectedTableId={selectedTable?.id}
             onDragStart={onDragStart}
             onClose={onClose}
             onStartPractice={onStartPractice}
@@ -289,17 +266,7 @@ export function LibraryMode({
             onAppendToChat={onAppendToChat}
             onDragStart={onDragStart}
             onSelectTag={handleSelectTag}
-          />
-        )
-      case 'table-detail':
-        return (
-          <TableDetailPanel
-            table={selectedTable}
-            activeProject={activeProject}
-            onClose={handleCloseTableDetail}
-            onAppendToChat={onAppendToChat}
-            onDragStart={onDragStart}
-            onSelectTag={handleSelectTag}
+            onSelectSource={handleSelectSource}
           />
         )
       case 'tags':

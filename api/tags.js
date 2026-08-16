@@ -65,5 +65,66 @@ export default async function handler(req, res) {
     return res.status(201).json(data)
   }
 
+  if (req.method === 'PATCH') {
+    const { id } = req.query
+    const { name, display_name, description } = req.body ?? {}
+    if (!id) return res.status(400).json({ error: 'id is required' })
+    if (name !== undefined && !name.trim()) return res.status(400).json({ error: 'name cannot be empty' })
+
+    const { data: existing, error: fetchError } = await supabase
+      .from('tags')
+      .select('id, project_id, name')
+      .eq('id', id)
+      .single()
+
+    if (fetchError) return res.status(404).json({ error: 'Tag not found' })
+
+    try {
+      await requireProjectAccess(user.id, existing.project_id)
+    } catch (e) {
+      if (e instanceof AuthError) return res.status(403).json({ error: e.message })
+      throw e
+    }
+
+    const updates = {}
+    if (name !== undefined) updates.name = name.trim()
+    if (display_name !== undefined) updates.display_name = display_name.trim() || null
+    if (description !== undefined) updates.description = description.trim() || null
+
+    const { data, error } = await supabase
+      .from('tags')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single()
+
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: 'A tag with that name already exists' })
+      return res.status(500).json({ error: error.message })
+    }
+
+    // knowledge_cards.tags is denormalized (stores the tag's `name` directly) — keep it in sync on rename
+    if (updates.name && updates.name !== existing.name) {
+      const { data: affectedCards, error: cardsError } = await supabase
+        .from('knowledge_cards')
+        .select('id, tags')
+        .eq('project_id', existing.project_id)
+        .contains('tags', [existing.name])
+
+      if (cardsError) return res.status(500).json({ error: cardsError.message })
+
+      for (const card of affectedCards) {
+        const newTags = card.tags.map(t => (t === existing.name ? updates.name : t))
+        const { error: updateCardError } = await supabase
+          .from('knowledge_cards')
+          .update({ tags: newTags })
+          .eq('id', card.id)
+        if (updateCardError) return res.status(500).json({ error: updateCardError.message })
+      }
+    }
+
+    return res.status(200).json(data)
+  }
+
   return res.status(405).json({ error: 'Method not allowed' })
 }

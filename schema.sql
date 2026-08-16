@@ -1,23 +1,25 @@
 -- schema.sql — single source of truth for the database
--- Run in Supabase SQL editor to apply.
+-- Run via `npm run migrate` (plain) to apply additively — safe, never touches existing data.
+-- Run via `npm run migrate:reset` to additionally drop-and-recreate the reset-friendly tables
+-- first (see below) — destructive, only for when a shape change genuinely can't be done as an
+-- ALTER. This file itself no longer contains any unconditional `drop table` for real data; the
+-- reset-only drops live in scripts/migrate.js's --reset path so plain `npm run migrate` (e.g. to
+-- pick up a new column via the retroactive-additions section below) can never accidentally wipe
+-- knowledge_cards/source_knowledge/skill again.
 --
 -- SACRED tables (sources, projects, contexts, tags): never drop, additive changes only.
--- RESET-FRIENDLY tables: drop and recreate freely during iteration.
+-- RESET-FRIENDLY tables (knowledge_cards, source_knowledge, skill): data can be regenerated from
+-- sources, so scripts/migrate.js --reset is allowed to drop and recreate them — but schema.sql
+-- itself stays additive-only; a shape change here should go through the retroactive-additions
+-- section (ALTER ... ADD COLUMN IF NOT EXISTS) rather than editing the CREATE TABLE below, unless
+-- you are deliberately about to run --reset.
 
--- ── RESET-FRIENDLY ───────────────────────────────────────────────────────────
-
+-- One-time cleanup: tables/table_cells/source_table_cells are retired — paradigms are now
+-- knowledge_cards with details.axes, and per-cell skill lives in the skill table below. Safe to
+-- leave in permanently: a no-op once these are gone from a given database.
 drop table if exists source_table_cells;
 drop table if exists table_cells;
 drop table if exists tables;
-drop table if exists source_knowledge;
-drop table if exists knowledge_cards;
--- tags is NOT dropped here — it holds curated catalog data
-
--- ── SACRED (never drop) ───────────────────────────────────────────────────────
--- drop table if exists sources;   ← keep commented as a reminder
--- drop table if exists projects;
--- drop table if exists contexts;  ← keep commented as a reminder
--- drop table if exists tags;      ← keep commented as a reminder
 
 -- ── CREATE ────────────────────────────────────────────────────────────────────
 
@@ -49,53 +51,36 @@ create table if not exists sources (
   created_at    timestamptz not null default now()
 );
 
-create table knowledge_cards (
+create table if not exists knowledge_cards (
   id                uuid primary key default gen_random_uuid(),
   project_id        uuid references projects(id) on delete cascade,
   kind              text not null check (kind in ('vocabulary','grammar','expression')),
   name              text not null,
-  details           jsonb,
+  details           jsonb,  -- may include "axes": [{name, values}] — ordered, present iff this card is a paradigm (see skill table below)
   tags              text[],
   related_card_ids  uuid[],
-  related_table_ids uuid[] default '{}',
-  skill             int check (skill between 1 and 10),
   importance        int check (importance between 1 and 10),
   created_at        timestamptz not null default now(),
   unique (project_id, name)
 );
 
-create table tables (
-  id           uuid primary key default gen_random_uuid(),
-  project_id   uuid not null references projects(id) on delete cascade,
-  name         text not null,
-  axes         jsonb not null,       -- ["case", "gender", "article_type"] — ordered list of axis names
-  axis_values  jsonb not null,       -- {"case": ["nominative",...], ...} — possible values per axis
-  tags         text[] default '{}',
-  notes        text,
-  created_at   timestamptz not null default now(),
-  updated_at   timestamptz not null default now(),
-  unique (project_id, name)
-);
-
-create table table_cells (
-  id           uuid primary key default gen_random_uuid(),
-  table_id     uuid not null references tables(id) on delete cascade,
-  cell_key     text not null,   -- canonical: axis names sorted alphabetically, values joined with "-"
-  axis_values  jsonb not null,  -- {"case": "accusative", "gender": "masculine", ...}
-  skill        smallint check (skill between 0 and 10),
-  created_at   timestamptz not null default now(),
-  updated_at   timestamptz not null default now(),
-  unique (table_id, cell_key)
-);
-
--- Source links to specific cells (not the whole table — that's the point of this table)
-create table source_table_cells (
-  id            uuid primary key default gen_random_uuid(),
-  source_id     uuid not null references sources(id) on delete cascade,
-  table_cell_id uuid not null references table_cells(id) on delete cascade,
-  excerpt       text,  -- surface form as it appeared, e.g. "den"
-  note          text,
-  created_at    timestamptz not null default now()
+-- A skill is a claim about a card that can be assessed — a card is a "thing you encountered",
+-- a skill is "how reliably you produce one facet of it". Flat cards (vocabulary/grammar/expression
+-- without axes) get types from lib/skillTypes.js's SKILL_TYPES registry, eagerly at level = 1
+-- (baseline, not yet practiced). Paradigm cards (details.axes present) get dotted-path types, one
+-- segment per axis, e.g. "akk.masc" — no row = that cell was never encountered. A row can still
+-- have level = null (manually cleared via the editor), distinct from both "never encountered" (no
+-- row) and a real level. `type` is free text validated in code (lib/skillTypes.js's
+-- validateSkillType), not a Postgres enum, since new types will be added often.
+create table if not exists skill (
+  id             uuid primary key default gen_random_uuid(),
+  card_id        uuid not null references knowledge_cards(id) on delete cascade,
+  type           text not null,
+  level          smallint check (level between 1 and 10),
+  importance     smallint check (importance between 1 and 10),
+  last_correct   timestamptz,  -- set only on a correct practice attempt, not on every attempt
+  created_at     timestamptz not null default now(),
+  unique (card_id, type)
 );
 
 -- Per-user settings: default project selection, etc.
@@ -119,7 +104,7 @@ create table if not exists tags (
   unique (project_id, name)
 );
 
-create table source_knowledge (
+create table if not exists source_knowledge (
   source_id         uuid not null references sources(id),
   knowledge_card_id uuid not null references knowledge_cards(id),
   positions         jsonb not null,  -- [{start, end}] absolute char offsets into sources.original_text
@@ -138,9 +123,7 @@ alter table source_knowledge       enable row level security;
 alter table contexts               enable row level security;
 alter table tags                   enable row level security;
 alter table user_settings          enable row level security;
-alter table tables                 enable row level security;
-alter table table_cells            enable row level security;
-alter table source_table_cells     enable row level security;
+alter table skill                  enable row level security;
 -- system_prompt_history RLS is enabled after the table is created below
 
 -- Remove old open-access policies
@@ -151,9 +134,7 @@ drop policy if exists "anon full access" on source_knowledge;
 drop policy if exists "anon full access" on contexts;
 drop policy if exists "anon full access" on tags;
 drop policy if exists "anon full access" on user_settings;
-drop policy if exists "anon full access" on tables;
-drop policy if exists "anon full access" on table_cells;
-drop policy if exists "anon full access" on source_table_cells;
+drop policy if exists "anon full access" on skill;
 -- system_prompt_history drop policy is applied after the table is created below
 
 -- All data access goes through /api/* serverless functions using the service role key,
@@ -190,33 +171,54 @@ create index if not exists idx_sources_project_id         on sources(project_id)
 create index if not exists idx_knowledge_cards_project_id on knowledge_cards(project_id);
 create index if not exists idx_tags_project_id            on tags(project_id);
 create index if not exists idx_contexts_project_id        on contexts(project_id);
-create index if not exists idx_tables_project_id          on tables(project_id);
-create index if not exists idx_table_cells_table          on table_cells(table_id);
-create index if not exists idx_stc_source                 on source_table_cells(source_id);
-create index if not exists idx_stc_cell                   on source_table_cells(table_cell_id);
+create index if not exists idx_skill_card_id               on skill(card_id);
+-- idx_skill_last_correct is created below, in RETROACTIVE COLUMN ADDITIONS — it must run after
+-- the last_practiced -> last_correct rename, since on an existing DB the column doesn't exist
+-- under its new name until then.
 
 -- ── RETROACTIVE COLUMN ADDITIONS ─────────────────────────────────────────────
 -- Safe to re-run on existing databases.
 
 alter table projects add column if not exists tts_locale      text;
 alter table projects add column if not exists context_required boolean not null default false;
+alter table skill add column if not exists importance smallint check (importance between 1 and 10);
+alter table skill alter column level set default 1;
+
+-- last_practiced -> last_correct: this now stamps only on a correct practice attempt, not on
+-- every attempt (see api/knowledge-cards.js's practice_result path), so the old name was
+-- misleading. Guarded since plain ALTER ... RENAME COLUMN has no IF EXISTS for columns.
+do $$
+begin
+  if exists (
+    select 1 from information_schema.columns
+    where table_name = 'skill' and column_name = 'last_practiced'
+  ) then
+    alter table skill rename column last_practiced to last_correct;
+  end if;
+end $$;
+alter index if exists idx_skill_last_practiced rename to idx_skill_last_correct;
+create index if not exists idx_skill_last_correct on skill(last_correct);
 
 
 -- ── FUNCTIONS ─────────────────────────────────────────────────────────────────
 
--- Atomically insert a knowledge_card and its source_knowledge link.
--- Called via supabase.rpc('save_card_and_link', { card, link }) from /api/save.js.
--- Returns the created knowledge_card row as JSON.
--- card must include project_id.
+-- Atomically insert a knowledge_card, its source_knowledge link, and (for a flat card — one
+-- without details.axes) its initial skill rows at level = 1 (baseline, not yet practiced). Called
+-- via supabase.rpc('save_card_and_link', { card, link, skills }) from /api/save.js, which builds
+-- `skills` as [{ type, importance }] — types via lib/skillTypes.js's deriveFlatSkillTypes(), each
+-- paired with a default importance via deriveSkillImportance(kind, type, card.importance); empty
+-- for paradigm cards, which get no skill rows eagerly (they appear lazily, per schema.sql's skill
+-- table comment). Returns the created knowledge_card row as JSON. card must include project_id.
 create or replace function save_card_and_link(
   card jsonb,
-  link jsonb
+  link jsonb,
+  skills jsonb default '[]'
 ) returns jsonb language plpgsql as $$
 declare
   new_card knowledge_cards;
 begin
-  insert into knowledge_cards (kind, name, details, tags, related_card_ids, related_table_ids, skill, importance, project_id)
-  select kind, name, details, tags, related_card_ids, related_table_ids, skill, importance, project_id
+  insert into knowledge_cards (kind, name, details, tags, related_card_ids, importance, project_id)
+  select kind, name, details, tags, related_card_ids, importance, project_id
   from jsonb_populate_record(null::knowledge_cards, card)
   returning * into new_card;
 
@@ -227,6 +229,13 @@ begin
     (link->'positions'),
     link->>'note'
   );
+
+  if jsonb_array_length(skills) > 0 then
+    insert into skill (card_id, type, level, importance)
+    select new_card.id, s->>'type', 1, (s->>'importance')::smallint
+    from jsonb_array_elements(skills) as s
+    on conflict (card_id, type) do nothing;
+  end if;
 
   return to_jsonb(new_card);
 end;

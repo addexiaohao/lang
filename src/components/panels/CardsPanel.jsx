@@ -2,15 +2,24 @@ import { useState, useEffect } from 'react'
 import { apiFetch } from '../../apiFetch.js'
 
 const PAGE_SIZE = 25
-const KINDS = ['vocabulary', 'grammar', 'expression', 'table']
+const KINDS = ['vocabulary', 'grammar', 'expression']
 const KIND_COLORS = {
   vocabulary: 'bg-green-100 text-green-700',
   grammar: 'bg-purple-100 text-purple-700',
   expression: 'bg-orange-100 text-orange-700',
-  table: 'bg-blue-100 text-blue-700',
 }
 
-export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onSelectTable, selectedTableId, onDragStart, onClose, onStartPractice }) {
+// 'all' | 'some' | 'none' — drives the card-level checkbox's checked/indeterminate state.
+// `skills` is undefined while not yet fetched (see cardSkills below) — treated as 'none'.
+function skillSelectionState(skills, selectedSkills) {
+  if (!skills || skills.length === 0) return 'none'
+  const selectedCount = skills.filter(s => selectedSkills.has(s.id)).length
+  if (selectedCount === 0) return 'none'
+  if (selectedCount === skills.length) return 'all'
+  return 'some'
+}
+
+export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDragStart, onClose, onStartPractice }) {
   const [items, setItems] = useState([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
@@ -20,13 +29,21 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onSele
   const [kind, setKind] = useState(null)
   const [page, setPage] = useState(0)
   const [refreshKey, setRefreshKey] = useState(0)
-  // Map<id, card> rather than a bare id Set — keeps full card data (name, kind, tags) for the
-  // whole selection even across pagination, so onStartPractice can hand the practice panel
-  // everything it needs without a second fetch.
-  const [selectedCards, setSelectedCards] = useState(() => new Map())
-  const [cardTotal, setCardTotal] = useState(0)
+
+  // Selection is over individual skills, not cards — Map<skill.id, skill> where skill carries its
+  // own `card` (embedded by /api/skills). A card's checkbox is a shortcut that selects/deselects
+  // all of that card's skills at once; expanding a card also lets you pick specific skills.
+  const [selectedSkills, setSelectedSkills] = useState(() => new Map())
+  // Map<card.id, skill[]> — fetched lazily (on expand, or on the card-level checkbox's first
+  // click) and cached so re-expanding or re-checking a card doesn't refetch.
+  const [cardSkills, setCardSkills] = useState(() => new Map())
+  const [expandedCards, setExpandedCards] = useState(() => new Set())
   const [selectAllLoading, setSelectAllLoading] = useState(false)
-  const [practiceMode, setPracticeMode] = useState('mc_cloze')
+  // Whether the "Select all" bulk action is the active selection — a plain flag rather than
+  // recomputing from cardSkills each render, since the bulk action covers every filtered card
+  // (possibly beyond the current page) and we don't want to refetch skills just to check that.
+  // Any individual toggle clears it.
+  const [selectAllActive, setSelectAllActive] = useState(false)
 
   useEffect(() => {
     setSearch('')
@@ -35,7 +52,10 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onSele
     setPage(0)
     setItems([])
     setTotal(0)
-    setSelectedCards(new Map())
+    setSelectedSkills(new Map())
+    setCardSkills(new Map())
+    setExpandedCards(new Set())
+    setSelectAllActive(false)
   }, [activeProject?.id])
 
   useEffect(() => {
@@ -59,9 +79,9 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onSele
     })
     if (debouncedSearch) params.set('q', debouncedSearch)
     if (kind) params.set('kind', kind)
-    apiFetch(`/api/library?${params}`)
+    apiFetch(`/api/knowledge-cards?${params}`)
       .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
-      .then(({ items, total, cardTotal }) => { setItems(items); setTotal(total); setCardTotal(cardTotal) })
+      .then(({ cards, total }) => { setItems(cards); setTotal(total) })
       .catch(e => setError(String(e)))
       .finally(() => setLoading(false))
   }, [activeProject?.id, debouncedSearch, kind, page, refreshKey])
@@ -69,40 +89,94 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onSele
   const pageCount = Math.ceil(total / PAGE_SIZE)
   const rangeStart = total === 0 ? 0 : page * PAGE_SIZE + 1
   const rangeEnd = Math.min((page + 1) * PAGE_SIZE, total)
-  const allFilteredSelected = cardTotal > 0 && selectedCards.size === cardTotal
+  const selectedCardCount = new Set(Array.from(selectedSkills.values(), s => s.card.id)).size
 
-  function toggleSelected(card) {
-    setSelectedCards(prev => {
+  async function loadCardSkills(cardId) {
+    const params = new URLSearchParams({ project_id: activeProject.id, card_ids: cardId })
+    const res = await apiFetch(`/api/skills?${params}`)
+    const data = await res.json().catch(() => ({}))
+    const skills = res.ok ? (data.skills ?? []) : []
+    setCardSkills(prev => new Map(prev).set(cardId, skills))
+    return skills
+  }
+
+  async function toggleExpand(cardId) {
+    setExpandedCards(prev => {
+      const next = new Set(prev)
+      if (next.has(cardId)) next.delete(cardId)
+      else next.add(cardId)
+      return next
+    })
+    if (!cardSkills.has(cardId)) await loadCardSkills(cardId)
+  }
+
+  function toggleSkill(skill) {
+    setSelectAllActive(false)
+    setSelectedSkills(prev => {
       const next = new Map(prev)
-      if (next.has(card.id)) next.delete(card.id)
-      else next.set(card.id, card)
+      if (next.has(skill.id)) next.delete(skill.id)
+      else next.set(skill.id, skill)
+      return next
+    })
+  }
+
+  async function toggleCardAll(card) {
+    setSelectAllActive(false)
+    const skills = cardSkills.get(card.id) ?? await loadCardSkills(card.id)
+    if (skills.length === 0) return
+    setSelectedSkills(prev => {
+      const next = new Map(prev)
+      const allSelected = skills.every(s => prev.has(s.id))
+      if (allSelected) skills.forEach(s => next.delete(s.id))
+      else skills.forEach(s => next.set(s.id, s))
       return next
     })
   }
 
   async function handleToggleSelectAll() {
-    if (allFilteredSelected) {
-      setSelectedCards(new Map())
+    if (selectAllActive) {
+      setSelectedSkills(new Map())
+      setSelectAllActive(false)
       return
     }
     setSelectAllLoading(true)
     try {
-      const params = new URLSearchParams({ project_id: activeProject.id, limit: String(total), offset: '0' })
-      if (debouncedSearch) params.set('q', debouncedSearch)
-      if (kind) params.set('kind', kind)
-      const r = await apiFetch(`/api/library?${params}`)
-      if (r.ok) {
-        const { items: allItems } = await r.json()
-        setSelectedCards(new Map(allItems.filter(i => i.type === 'card').map(c => [c.id, c])))
+      const cardParams = new URLSearchParams({ project_id: activeProject.id, limit: String(total), offset: '0' })
+      if (debouncedSearch) cardParams.set('q', debouncedSearch)
+      if (kind) cardParams.set('kind', kind)
+      const cardsRes = await apiFetch(`/api/knowledge-cards?${cardParams}`)
+      if (!cardsRes.ok) return
+      const { cards: allCards } = await cardsRes.json()
+      if (allCards.length === 0) return
+
+      const skillsParams = new URLSearchParams({ project_id: activeProject.id, card_ids: allCards.map(c => c.id).join(',') })
+      const skillsRes = await apiFetch(`/api/skills?${skillsParams}`)
+      if (!skillsRes.ok) return
+      const { skills: allSkills } = await skillsRes.json()
+
+      const byCard = new Map()
+      for (const s of allSkills) {
+        if (!byCard.has(s.card.id)) byCard.set(s.card.id, [])
+        byCard.get(s.card.id).push(s)
       }
+      setCardSkills(prev => {
+        const next = new Map(prev)
+        for (const card of allCards) next.set(card.id, byCard.get(card.id) ?? [])
+        return next
+      })
+      setSelectedSkills(new Map(allSkills.map(s => [s.id, s])))
+      setSelectAllActive(true)
     } finally {
       setSelectAllLoading(false)
     }
   }
 
+  // Practice is generated per-skill (see lib/practiceRules.js, CLAUDE.md's "Skills" section) —
+  // selectedSkills already holds the exact { id, type, card, ... } rows to practice, so this just
+  // reshapes them into what onStartPractice expects, no extra fetch needed.
   function handleStartPractice() {
-    if (selectedCards.size === 0) return
-    onStartPractice(Array.from(selectedCards.values()), practiceMode)
+    if (selectedSkills.size === 0) return
+    onStartPractice(Array.from(selectedSkills.values(), s => ({ card: s.card, type: s.type })))
   }
 
   return (
@@ -178,13 +252,13 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onSele
               </button>
             ))}
           </div>
-          {cardTotal > 0 && (
+          {total > 0 && (
             <button
               onClick={handleToggleSelectAll}
               disabled={selectAllLoading}
               className="text-[10px] text-blue-600 hover:text-blue-800 disabled:opacity-40 transition-colors shrink-0"
             >
-              {selectAllLoading ? 'Selecting…' : allFilteredSelected ? 'Clear selection' : `Select all ${cardTotal}`}
+              {selectAllLoading ? 'Selecting…' : selectAllActive ? 'Clear selection' : `Select all ${total}`}
             </button>
           )}
         </div>
@@ -202,108 +276,102 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onSele
             {search || kind ? 'No cards match.' : 'No cards yet.'}
           </p>
         )}
-        {items.map(item => item.type === 'table' ? (
-          <div
-            key={item.id}
-            className={`flex items-stretch border-b border-gray-100 transition-colors ${
-              item.id === selectedTableId ? 'bg-blue-50 border-l-2 border-l-blue-500' : 'hover:bg-gray-50'
-            }`}
-          >
-            <div className="pl-3 shrink-0 flex items-center text-gray-300">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3">
-                <rect x="3" y="3" width="18" height="18" rx="1" /><line x1="3" y1="9" x2="21" y2="9" /><line x1="3" y1="15" x2="21" y2="15" /><line x1="9" y1="3" x2="9" y2="21" /><line x1="15" y1="3" x2="15" y2="21" />
-              </svg>
+        {items.map(item => {
+          const skills = cardSkills.get(item.id)
+          const expanded = expandedCards.has(item.id)
+          const state = skillSelectionState(skills, selectedSkills)
+          return (
+            <div key={item.id} className="border-b border-gray-100">
+              <div
+                className={`flex items-stretch transition-colors ${
+                  item.id === selectedCardId ? 'bg-blue-50 border-l-2 border-l-blue-500' : 'hover:bg-gray-50'
+                }`}
+              >
+                <button
+                  onClick={() => toggleExpand(item.id)}
+                  aria-label={expanded ? 'Collapse skills' : 'Expand skills'}
+                  className="flex items-center justify-center w-4 shrink-0 text-gray-300 hover:text-gray-500"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"
+                    className={`w-2.5 h-2.5 transition-transform ${expanded ? 'rotate-90' : ''}`}>
+                    <polyline points="9 18 15 12 9 6" />
+                  </svg>
+                </button>
+                <label className="flex items-center pl-1 pr-1 shrink-0 cursor-pointer" title="Select all skills for this card">
+                  <input
+                    type="checkbox"
+                    ref={el => { if (el) el.indeterminate = state === 'some' }}
+                    checked={state === 'all'}
+                    onChange={() => toggleCardAll(item)}
+                    className="w-3 h-3"
+                  />
+                </label>
+                <button onClick={() => onSelectCard(item)} className="flex-1 min-w-0 text-left pl-1 pr-3 py-2.5">
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="text-xs font-medium text-gray-800 leading-snug">{item.name}</span>
+                    <span className={`text-[10px] rounded px-1.5 py-0.5 font-medium shrink-0 ${KIND_COLORS[item.kind] ?? 'bg-gray-100 text-gray-600'}`}>
+                      {item.kind}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1 mt-1 flex-wrap">
+                    {item.tags?.slice(0, 3).map(tag => (
+                      <span key={tag} className="text-[10px] bg-gray-100 text-gray-500 rounded px-1 py-0.5">{tag}</span>
+                    ))}
+                    {item.tags?.length > 3 && (
+                      <span className="text-[10px] text-gray-400">+{item.tags.length - 3}</span>
+                    )}
+                    <span className="ml-auto flex items-center gap-2 shrink-0">
+                      <span title="Linked sources" className="flex items-center gap-0.5 text-[10px] text-gray-400">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-2.5 h-2.5">
+                          <path d="M10 13a5 5 0 007.07 0l1.93-1.93a5 5 0 00-7.07-7.07L10.5 5.5" />
+                          <path d="M14 11a5 5 0 00-7.07 0l-1.93 1.93a5 5 0 007.07 7.07L13.5 18.5" />
+                        </svg>
+                        {item.link_count ?? 0}
+                      </span>
+                      {item.importance != null && (
+                        <span title="Importance" className="text-[10px] text-gray-400">★ {item.importance}</span>
+                      )}
+                    </span>
+                  </div>
+                </button>
+              </div>
+              {expanded && (
+                <div className="pl-9 pr-3 pb-1.5 bg-gray-50/60">
+                  {skills === undefined ? (
+                    <p className="text-[10px] text-gray-400 py-1">Loading skills…</p>
+                  ) : skills.length === 0 ? (
+                    <p className="text-[10px] text-gray-400 py-1">No skills yet.</p>
+                  ) : (
+                    skills.map(s => (
+                      <label key={s.id} className="flex items-center gap-1.5 py-0.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={selectedSkills.has(s.id)}
+                          onChange={() => toggleSkill(s)}
+                          className="w-3 h-3"
+                        />
+                        <span className="text-[10px] text-gray-600">{s.type}</span>
+                        <span className="text-[10px] text-gray-400">
+                          {s.level != null ? `· level ${s.level}` : '· not yet assessed'}
+                        </span>
+                      </label>
+                    ))
+                  )}
+                </div>
+              )}
             </div>
-            <button onClick={() => onSelectTable(item)} className="flex-1 min-w-0 text-left pl-2 pr-3 py-2.5">
-              <div className="flex items-start justify-between gap-2">
-                <span className="text-xs font-medium text-gray-800 leading-snug">{item.name}</span>
-                <span className={`text-[10px] rounded px-1.5 py-0.5 font-medium shrink-0 ${KIND_COLORS.table}`}>
-                  table
-                </span>
-              </div>
-              <div className="flex items-center gap-1 mt-1 flex-wrap">
-                {item.tags?.slice(0, 3).map(tag => (
-                  <span key={tag} className="text-[10px] bg-gray-100 text-gray-500 rounded px-1 py-0.5">{tag}</span>
-                ))}
-                {item.tags?.length > 3 && (
-                  <span className="text-[10px] text-gray-400">+{item.tags.length - 3}</span>
-                )}
-                <span className="ml-auto text-[10px] text-gray-400 shrink-0">
-                  {item.filled_count}/{item.cell_count} cells
-                </span>
-              </div>
-            </button>
-          </div>
-        ) : (
-          <div
-            key={item.id}
-            className={`flex items-stretch border-b border-gray-100 transition-colors ${
-              item.id === selectedCardId ? 'bg-blue-50 border-l-2 border-l-blue-500' : 'hover:bg-gray-50'
-            }`}
-          >
-            <label className="flex items-center pl-3 shrink-0 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={selectedCards.has(item.id)}
-                onChange={() => toggleSelected(item)}
-                className="w-3 h-3"
-              />
-            </label>
-            <button onClick={() => onSelectCard(item)} className="flex-1 min-w-0 text-left pl-2 pr-3 py-2.5">
-              <div className="flex items-start justify-between gap-2">
-                <span className="text-xs font-medium text-gray-800 leading-snug">{item.name}</span>
-                <span className={`text-[10px] rounded px-1.5 py-0.5 font-medium shrink-0 ${KIND_COLORS[item.kind] ?? 'bg-gray-100 text-gray-600'}`}>
-                  {item.kind}
-                </span>
-              </div>
-              <div className="flex items-center gap-1 mt-1 flex-wrap">
-                {item.tags?.slice(0, 3).map(tag => (
-                  <span key={tag} className="text-[10px] bg-gray-100 text-gray-500 rounded px-1 py-0.5">{tag}</span>
-                ))}
-                {item.tags?.length > 3 && (
-                  <span className="text-[10px] text-gray-400">+{item.tags.length - 3}</span>
-                )}
-                <span className="ml-auto flex items-center gap-2 shrink-0">
-                  <span title="Linked sources" className="flex items-center gap-0.5 text-[10px] text-gray-400">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-2.5 h-2.5">
-                      <path d="M10 13a5 5 0 007.07 0l1.93-1.93a5 5 0 00-7.07-7.07L10.5 5.5" />
-                      <path d="M14 11a5 5 0 00-7.07 0l-1.93 1.93a5 5 0 007.07 7.07L13.5 18.5" />
-                    </svg>
-                    {item.link_count ?? 0}
-                  </span>
-                  {item.importance != null && (
-                    <span title="Importance" className="text-[10px] text-gray-400">★ {item.importance}</span>
-                  )}
-                  {item.skill != null && (
-                    <span className="text-[10px] text-gray-400">{item.skill}/10</span>
-                  )}
-                </span>
-              </div>
-            </button>
-          </div>
-        ))}
+          )
+        })}
       </div>
 
-      {selectedCards.size > 0 && (
+      {selectedSkills.size > 0 && (
         <div className="px-3 py-2 border-t bg-white flex items-center gap-2 shrink-0">
-          <span className="text-[10px] text-gray-500 shrink-0">{selectedCards.size} selected</span>
-          <div className="flex gap-1 ml-auto">
-            <button
-              onClick={() => setPracticeMode('mc_cloze')}
-              className={`text-[10px] rounded px-1.5 py-0.5 transition-colors ${practiceMode === 'mc_cloze' ? 'bg-gray-800 text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}
-            >
-              Cloze
-            </button>
-            <button
-              onClick={() => setPracticeMode('exemplar')}
-              className={`text-[10px] rounded px-1.5 py-0.5 transition-colors ${practiceMode === 'exemplar' ? 'bg-gray-800 text-white' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}
-            >
-              Examples
-            </button>
-          </div>
+          <span className="text-[10px] text-gray-500 shrink-0">
+            {selectedSkills.size} skill{selectedSkills.size > 1 ? 's' : ''} selected ({selectedCardCount} card{selectedCardCount > 1 ? 's' : ''})
+          </span>
           <button
             onClick={handleStartPractice}
-            className="text-[10px] font-medium bg-blue-600 text-white rounded px-2.5 py-1 hover:bg-blue-700 transition-colors shrink-0"
+            className="text-[10px] font-medium bg-blue-600 text-white rounded px-2.5 py-1 hover:bg-blue-700 transition-colors shrink-0 ml-auto"
           >
             Practice
           </button>

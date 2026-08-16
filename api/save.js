@@ -1,6 +1,7 @@
 import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
 import { resolvePositions } from '../lib/resolvePositions.js'
+import { deriveFlatSkillTypes, deriveSkillImportance } from '../lib/skillTypes.js'
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -80,7 +81,13 @@ export default async function handler(req, res) {
 
     const card = { ...cardFields, project_id }
     const link = { source_id, positions }
-    const { data, error } = await supabase.rpc('save_card_and_link', { card, link })
+    const axes = card.details?.axes
+    const skill_types = Array.isArray(axes) && axes.length > 0 ? [] : deriveFlatSkillTypes(card)
+    const skills = skill_types.map(type => ({
+      type,
+      importance: deriveSkillImportance(card.kind, type, card.importance),
+    }))
+    const { data, error } = await supabase.rpc('save_card_and_link', { card, link, skills })
     if (error) {
       if (error.code === '23505') return res.status(409).json({ error: `A card named "${card.name}" already exists in this project` })
       return res.status(500).json({ error: error.message })
@@ -88,71 +95,7 @@ export default async function handler(req, res) {
     return res.status(201).json(data)
   }
 
-  if (table === 'table') {
-    const { ref: _ref, existing_id: _eid, ...tableFields } = record
-    const row = { ...tableFields, project_id }
-    const { data, error } = await supabase
-      .from('tables')
-      .insert(row)
-      .select()
-      .single()
-    if (error) {
-      if (error.code === '23505') return res.status(409).json({ error: `A table named "${row.name}" already exists in this project` })
-      return res.status(500).json({ error: error.message })
-    }
-    return res.status(201).json(data)
-  }
-
-  if (table === 'table_cell') {
-    const { table_id, axis_values, skill } = record
-    if (!table_id) return res.status(400).json({ error: 'table_id is required' })
-    if (!axis_values || typeof axis_values !== 'object') return res.status(400).json({ error: 'axis_values is required' })
-    if (!(await belongsToProject('tables', table_id, project_id))) {
-      return res.status(404).json({ error: 'Table not found' })
-    }
-    const cell_key = deriveCellKey(axis_values)
-    const row = { table_id, cell_key, axis_values, ...(skill != null ? { skill } : {}) }
-    const { data, error } = await supabase
-      .from('table_cells')
-      .upsert(row, { onConflict: 'table_id,cell_key' })
-      .select()
-      .single()
-    if (error) return res.status(500).json({ error: error.message })
-    return res.status(201).json(data)
-  }
-
-  if (table === 'link_table_cell') {
-    const { source_id, table_cell_id, excerpt, note } = record
-    if (!source_id || !table_cell_id) return res.status(400).json({ error: 'source_id and table_cell_id are required' })
-    if (!(await belongsToProject('sources', source_id, project_id))) {
-      return res.status(404).json({ error: 'Source not found' })
-    }
-    const { data: cell, error: cellErr } = await supabase
-      .from('table_cells')
-      .select('id, tables!inner(project_id)')
-      .eq('id', table_cell_id)
-      .eq('tables.project_id', project_id)
-      .single()
-    if (cellErr || !cell) return res.status(404).json({ error: 'Table cell not found' })
-    const { data, error } = await supabase
-      .from('source_table_cells')
-      .insert({ source_id, table_cell_id, excerpt: excerpt || null, note: note || null })
-      .select()
-      .single()
-    if (error) return res.status(500).json({ error: error.message })
-    return res.status(201).json(data)
-  }
-
   return res.status(400).json({ error: `Unknown table: ${table}` })
-}
-
-// Derives the canonical cell key from an axis_values object.
-// Axis names are sorted alphabetically; values are lowercased and slugified.
-function deriveCellKey(axisValues) {
-  return Object.keys(axisValues)
-    .sort()
-    .map(k => String(axisValues[k]).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''))
-    .join('-')
 }
 
 // Fetches original_text for source_id (scoped to project_id), resolves annotated_sentence to
@@ -178,9 +121,7 @@ async function resolveLink(source_id, project_id, annotated_sentence, res) {
   }
 }
 
-// Checks that a row with the given id exists in `tableName` (one with its own project_id
-// column) scoped to project_id. table_cells has no project_id of its own — its ownership check
-// is inlined above via a join through its parent `tables` row instead.
+// Checks that a row with the given id exists in `tableName` scoped to project_id.
 async function belongsToProject(tableName, id, project_id) {
   const { data, error } = await supabase
     .from(tableName)

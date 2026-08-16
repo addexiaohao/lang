@@ -1,27 +1,29 @@
 import { useState, useEffect } from 'react'
 import GermanText from './GermanText.jsx'
 
-// MC cloze exercise body. `item` is a practice.mc_cloze response: { sentence, options, answer, translation, option_meanings? }.
-// option_meanings (one English gloss per option, vocabulary cards only) is revealed exactly when the translation is.
-export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain, onAddSource, addSourceDisabled, onEasierSentence, easierCount = 0, maxEasierAttempts = 0 }) {
-  const [selected, setSelected] = useState(null)
+// Spelling exercise body. `item` is a practice.spelling response: { sentence, answer, meaning, translation }.
+// No options — the learner types the exact answer (capitalization, umlauts, etc. all count), graded
+// after trimming leading/trailing whitespace only.
+export default function PracticeSpelling({ item, onWeiter, onAnswered, onExplain, onAddSource, addSourceDisabled, onEasierSentence, easierCount = 0, maxEasierAttempts = 0 }) {
+  const [value, setValue] = useState('')
+  const [revealed, setRevealed] = useState(false)
   const [dontKnow, setDontKnow] = useState(false)
   const [showTranslation, setShowTranslation] = useState(false)
-  const revealed = selected !== null || dontKnow
-  const correct = selected === item.answer
+  const correct = !dontKnow && value.trim() === item.answer
 
-  useEffect(() => { setSelected(null); setDontKnow(false); setShowTranslation(false) }, [item])
+  useEffect(() => { setValue(''); setRevealed(false); setDontKnow(false); setShowTranslation(false) }, [item])
 
   const [before, after] = item.sentence.split('___')
 
-  function choose(opt) {
-    if (revealed) return
-    setSelected(opt)
-    onAnswered?.(opt === item.answer)
+  function submit() {
+    if (!value.trim() || revealed) return
+    setRevealed(true)
+    onAnswered?.(value.trim() === item.answer)
   }
 
   function giveUp() {
     setDontKnow(true)
+    setRevealed(true)
     onAnswered?.(false)
   }
 
@@ -39,34 +41,33 @@ export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain,
                   : 'border-red-500 text-red-700 bg-red-50'
             }`}
           >
-            {revealed ? (dontKnow ? '?' : selected) : '_____'}
+            {revealed ? (dontKnow ? '?' : value.trim()) : '_____'}
           </span>
           <GermanText>{after}</GermanText>
         </p>
 
-        <div className="mt-5 space-y-2">
-          {item.options.map((opt, i) => {
-            const isChosen = opt === selected
-            const isCorrect = opt === item.answer
-            let cls = 'border-gray-200 hover:border-gray-300 hover:bg-gray-50'
-            if (revealed && isCorrect) cls = 'border-green-500 bg-green-50 text-green-800'
-            else if (revealed && isChosen) cls = 'border-red-500 bg-red-50 text-red-800'
-            else if (revealed) cls = 'border-gray-200 opacity-50'
-            return (
-              <button
-                key={opt}
-                onClick={() => choose(opt)}
-                disabled={revealed}
-                className={`w-full text-left px-3 py-2 rounded-lg border text-sm transition-colors ${cls}`}
-              >
-                {opt}
-                {showTranslation && item.option_meanings && (
-                  <span className="block text-xs font-normal text-gray-400 mt-0.5">{item.option_meanings[i]}</span>
-                )}
-              </button>
-            )
-          })}
-        </div>
+        <p className="mt-2 text-sm text-gray-500 italic">{item.meaning}</p>
+
+        {!revealed && (
+          <div className="mt-4 flex items-center gap-2">
+            <input
+              type="text"
+              value={value}
+              onChange={e => setValue(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') submit() }}
+              autoFocus
+              placeholder="Type your answer…"
+              className="flex-1 min-w-0 px-3 py-2 rounded-lg border border-gray-300 text-sm focus:outline-none focus:border-blue-400"
+            />
+            <button
+              onClick={submit}
+              disabled={!value.trim()}
+              className="text-sm font-medium bg-blue-600 text-white rounded-lg px-3 py-2 hover:bg-blue-700 disabled:bg-gray-200 disabled:text-gray-400 transition-colors shrink-0"
+            >
+              Check
+            </button>
+          </div>
+        )}
 
         {!revealed && (
           <button
@@ -77,7 +78,7 @@ export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain,
           </button>
         )}
 
-        {revealed && selected !== item.answer && (
+        {revealed && !correct && (
           <p className="mt-3 text-xs text-gray-500">
             Correct answer: <span className="font-medium text-gray-700">{item.answer}</span>
           </p>

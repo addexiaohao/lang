@@ -4,9 +4,6 @@ import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
 import SaveCard from './SaveCard.jsx'
 import LinkCard from './LinkCard.jsx'
-import TableSaveCard from './TableSaveCard.jsx'
-import TableCellSaveCard from './TableCellSaveCard.jsx'
-import LinkTableCellCard from './LinkTableCellCard.jsx'
 import GermanText from './GermanText.jsx'
 import { apiFetch } from '../apiFetch.js'
 
@@ -17,22 +14,9 @@ const TABLE_SCHEMA = {
   },
   knowledge_card: {
     required: ['kind', 'name'],
-    optional: ['details', 'tags', 'skill', 'importance'],
+    optional: ['details', 'tags', 'importance'],
     enums: { kind: ['vocabulary', 'grammar', 'expression'] },
-    ranges: { skill: [1, 10], importance: [1, 10] },
-  },
-  table: {
-    required: ['name', 'axes', 'axis_values'],
-    optional: ['tags', 'notes'],
-  },
-  table_cell: {
-    required: ['axis_values'],
-    optional: ['skill'],
-    ranges: { skill: [0, 10] },
-  },
-  link_table_cell: {
-    required: [],
-    optional: ['excerpt', 'note'],
+    ranges: { importance: [1, 10] },
   },
   source_knowledge: {
     required: ['source_id', 'knowledge_card_id'],
@@ -92,7 +76,6 @@ function parseSaveBlocks(content) {
   let match
 
   let lastSourceBlockIndex = null
-  let lastTableBlockIndex = null
 
   while ((match = regex.exec(content)) !== null) {
     const textBefore = content.slice(lastIndex, match.index).trim()
@@ -111,20 +94,14 @@ function parseSaveBlocks(content) {
         const sourceRef = rawRecord.source_ref ?? null
         const existingId = rawRecord.existing_id ?? null
         const annotatedSentence = rawRecord.annotated_sentence ?? null
-        const tableRef = rawRecord.table_ref ?? null
-        const existingCellId = rawRecord.existing_cell_id ?? null
-        // axis_values for link_table_cell is meta (used for lookup); for other blocks it stays in record
-        const axisValuesForLink = table === 'link_table_cell' ? (rawRecord.axis_values ?? null) : null
 
-        const metaKeys = new Set(['ref', 'source_ref', 'existing_id', 'new_tags', 'annotated_sentence', 'table_ref', 'existing_cell_id'])
-        if (table === 'link_table_cell') metaKeys.add('axis_values')
+        const metaKeys = new Set(['ref', 'source_ref', 'existing_id', 'new_tags', 'annotated_sentence'])
 
         const record = Object.fromEntries(Object.entries(rawRecord).filter(([k]) => !metaKeys.has(k)))
 
         const { warnings, unknownFields } = validateBlock(table, record)
         const bi = blockIndex++
         if (table === 'source') lastSourceBlockIndex = bi
-        if (table === 'table') lastTableBlockIndex = bi
 
         segments.push({
           type: 'block',
@@ -134,14 +111,10 @@ function parseSaveBlocks(content) {
           unknownFields,
           blockIndex: bi,
           sourceGroupIndex: lastSourceBlockIndex,
-          tableGroupIndex: lastTableBlockIndex,
           ref,
           sourceRef,
           existingId,
           annotatedSentence,
-          tableRef,
-          existingCellId,
-          axisValuesForLink,  // only set for link_table_cell
         })
       }
     } catch {
@@ -155,13 +128,6 @@ function parseSaveBlocks(content) {
   if (textAfter) segments.push({ type: 'text', content: textAfter })
 
   return segments
-}
-
-function deriveCellKey(axisValues) {
-  return Object.keys(axisValues)
-    .sort()
-    .map(k => String(axisValues[k]).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''))
-    .join('-')
 }
 
 function parseFieldsToRecord(fields, originalRecord) {
@@ -213,6 +179,20 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
     setProposedTagMeta(prev => ({ ...prev, [name]: { ...prev[name], displayName } }))
   }, [])
 
+  // Tags a user types into a card's own "+ new tag" dropdown (as opposed to
+  // ones the LLM declared up front via save:proposed_tags), keyed by blockIndex.
+  const [cardExtraTags, setCardExtraTags] = useState({})
+  const handleAddNewTag = useCallback((bi, name) => {
+    setProposedTagMeta(prev => prev[name] ? prev : { ...prev, [name]: { displayName: '' } })
+    setCardExtraTags(prev => {
+      const existing = prev[bi] ?? []
+      if (existing.includes(name)) return prev
+      return { ...prev, [bi]: [...existing, name] }
+    })
+  }, [])
+
+  const catalogNameSet = useMemo(() => new Set(tagCatalog.map(t => t.name)), [tagCatalog])
+
   const handleConfirmTag = useCallback(async (name) => {
     const meta = proposedTagMeta[name] ?? {}
     setProposedTagMeta(prev => ({ ...prev, [name]: { ...prev[name], confirming: true } }))
@@ -238,13 +218,6 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
   const savedSourceIdsRef = useRef({})
   const registeredRefsRef = useRef(new Set())
   const registeredSavedRefsRef = useRef(new Set())
-
-  // Table ref tracking: maps table ref → { id, name }
-  // Cell ref tracking: maps "{tableRef}:{cellKey}" → table_cell_id
-  const [savedTableRefs, setSavedTableRefs] = useState({})
-  const savedTableRefsRef = useRef({})
-  const [savedCellRefs, setSavedCellRefs] = useState({})
-  const savedCellRefsRef = useRef({})
 
   // User corrections to the agent-emitted annotated_sentence, keyed by blockIndex.
   // Falls back to the parsed block's original annotatedSentence when absent.
@@ -282,13 +255,6 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
         savedSourceIdsRef.current[block.blockIndex] = block.existingId
         setSavedSourceIds(prev => ({ ...prev, [block.blockIndex]: block.existingId }))
         if (block.ref != null) onSourceSaved?.(block.ref, block.existingId)
-      }
-      // Pre-register existing tables so cells are immediately unblocked
-      if (block.table === 'table' && block.existingId != null && block.ref != null
-          && !savedTableRefsRef.current[block.ref]) {
-        const name = block.record.name ?? ''
-        savedTableRefsRef.current[block.ref] = { id: block.existingId, name }
-        setSavedTableRefs(prev => ({ ...prev, [block.ref]: { id: block.existingId, name } }))
       }
     }
   }, [blocks.length, isUser, onSourceSaved])
@@ -345,19 +311,6 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
     }
   }
 
-  function handleTableSaved(bi, tableRefKey, tableId, tableName) {
-    savedTableRefsRef.current[tableRefKey] = { id: tableId, name: tableName }
-    setSavedTableRefs(prev => ({ ...prev, [tableRefKey]: { id: tableId, name: tableName } }))
-    setSaveStates(prev => prev.map((s, i) => i === bi ? { status: 'saved', id: tableId } : s))
-  }
-
-  function handleCellSaved(bi, tableRefKey, cellKey, cellId) {
-    const mapKey = `${tableRefKey}:${cellKey}`
-    savedCellRefsRef.current[mapKey] = cellId
-    setSavedCellRefs(prev => ({ ...prev, [mapKey]: cellId }))
-    setSaveStates(prev => prev.map((s, i) => i === bi ? { status: 'saved', id: cellId } : s))
-  }
-
   async function handleLink(bi, existingCardId = null) {
     const block = blocks.find(b => b.blockIndex === bi)
     const cardId = existingCardId ?? block.existingId
@@ -382,40 +335,11 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
     }
   }
 
-  async function handleLinkTableCell(bi) {
-    const block = blocks.find(b => b.blockIndex === bi)
-    const sourceId = block.sourceRef != null
-      ? sourceRefMap[block.sourceRef]?.id
-      : savedSourceIdsRef.current[block.sourceGroupIndex]
-
-    // Resolve table cell id: prefer existing_cell_id, then look up from savedCellRefs
-    let tableCellId = block.existingCellId ?? null
-    if (!tableCellId && block.tableRef != null && block.axisValuesForLink) {
-      const cellKey = deriveCellKey(block.axisValuesForLink)
-      tableCellId = savedCellRefsRef.current[`${block.tableRef}:${cellKey}`] ?? null
-    }
-
-    if (!sourceId || !tableCellId) return
-    setLinkStates(prev => prev.map((s, i) => i === bi ? { status: 'linking' } : s))
-    try {
-      const linkRecord = { source_id: sourceId, table_cell_id: tableCellId, excerpt: block.record.excerpt || undefined, note: block.record.note || undefined }
-      const res = await apiFetch('/api/save', {
-        method: 'POST',
-        body: JSON.stringify({ project_id: projectId, table: 'link_table_cell', record: linkRecord }),
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
-      setLinkStates(prev => prev.map((s, i) => i === bi ? { status: 'linked' } : s))
-    } catch (err) {
-      setLinkStates(prev => prev.map((s, i) => i === bi ? { status: 'error', error: err.message } : s))
-    }
-  }
-
-  // Save in document order: tables before their cells, sources before their cards/links
+  // Save in document order: sources before their cards/links
   async function handleSaveAll() {
     for (let i = 0; i < blocks.length; i++) {
       const block = blocks[i]
-      const isLinkBlock = block.table === 'link_card' || block.table === 'link_table_cell'
+      const isLinkBlock = block.table === 'link_card'
       if (isLinkBlock) {
         if (linkStates[i]?.status !== 'linked') await cardRefs.current[i]?.save()
       } else if (saveStates[i]?.status !== 'saved') {
@@ -443,41 +367,9 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
             )
           }
           if (segment.type === 'proposed_tags') {
-            const catalogNameSet = new Set(tagCatalog.map(t => t.name))
-            const pendingTags = segment.tags.filter(name => !catalogNameSet.has(name))
-            if (pendingTags.length === 0) return null
-            return (
-              <div key={i} className="border border-amber-200 rounded-xl bg-amber-50 p-3 space-y-3 text-sm">
-                <span className="text-xs font-semibold text-amber-700 uppercase tracking-wide">Proposed Tags</span>
-                {pendingTags.map(name => {
-                  const meta = proposedTagMeta[name] ?? {}
-                  const isConfirming = meta.confirming ?? false
-                  return (
-                    <div key={name} className="bg-white border border-amber-200 rounded-lg p-3 space-y-2">
-                      <div className="text-xs font-mono text-amber-800 bg-amber-100 border border-amber-300 px-2 py-1 rounded break-all">{name}</div>
-                      <input
-                        className="w-full text-xs border border-amber-200 rounded px-2 py-1.5 bg-white focus:outline-none focus:ring-1 focus:ring-amber-400 disabled:opacity-50"
-                        placeholder="display name…"
-                        value={meta.displayName ?? ''}
-                        onChange={e => updateProposedTagDisplayName(name, e.target.value)}
-                        disabled={isConfirming}
-                      />
-                      <button
-                        onClick={() => handleConfirmTag(name)}
-                        disabled={isConfirming}
-                        className={`w-full py-1.5 text-xs font-medium rounded-md transition-colors ${
-                          isConfirming
-                            ? 'bg-amber-300 text-amber-900 cursor-not-allowed'
-                            : 'bg-amber-500 text-white hover:bg-amber-600'
-                        }`}
-                      >
-                        {isConfirming ? 'Saving…' : 'Confirm'}
-                      </button>
-                    </div>
-                  )
-                })}
-              </div>
-            )
+            // Declared by the LLM up front, but intentionally not rendered here —
+            // each new tag instead surfaces just above the card(s) that use it, below.
+            return null
           }
           if (segment.type === 'block') {
             if (segment.table === 'source_knowledge') return null
@@ -501,95 +393,75 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
               )
             }
 
-            if (segment.table === 'table') {
-              return (
-                <TableSaveCard
-                  key={i}
-                  ref={el => { cardRefs.current[bi] = el }}
-                  record={segment.record}
-                  saveState={saveStates[bi] ?? { status: 'idle' }}
-                  existingId={segment.existingId}
-                  projectId={projectId}
-                  onSaved={(id, name) => handleTableSaved(bi, segment.ref, id, name)}
-                />
-              )
-            }
-
-            if (segment.table === 'table_cell') {
-              const tableRefKey = segment.tableRef
-              const tableData = savedTableRefs[tableRefKey]
-              const tableBlocked = !tableData?.id
-              return (
-                <TableCellSaveCard
-                  key={i}
-                  ref={el => { cardRefs.current[bi] = el }}
-                  record={segment.record}
-                  saveState={saveStates[bi] ?? { status: 'idle' }}
-                  blocked={tableBlocked}
-                  tableName={tableData?.name}
-                  tableId={tableData?.id}
-                  projectId={projectId}
-                  onSaved={(cellId, cellKey) => handleCellSaved(bi, tableRefKey, cellKey, cellId)}
-                />
-              )
-            }
-
-            if (segment.table === 'link_table_cell') {
-              const sourceId = segment.sourceRef != null
-                ? sourceRefMap[segment.sourceRef]?.id
-                : savedSourceIds[segment.sourceGroupIndex]
-              const tableRefKey = segment.tableRef
-              const tableData = savedTableRefs[tableRefKey]
-              let tableCellId = segment.existingCellId ?? null
-              if (!tableCellId && tableRefKey && segment.axisValuesForLink) {
-                const cellKey = deriveCellKey(segment.axisValuesForLink)
-                tableCellId = savedCellRefs[`${tableRefKey}:${cellKey}`] ?? null
-              }
-              return (
-                <LinkTableCellCard
-                  key={i}
-                  ref={el => { cardRefs.current[bi] = el }}
-                  record={segment.record}
-                  linkState={linkStates[bi] ?? { status: 'idle' }}
-                  sourceId={sourceId}
-                  tableCellId={tableCellId}
-                  tableName={tableData?.name}
-                  axisValues={segment.axisValuesForLink}
-                  onLink={() => handleLinkTableCell(bi)}
-                />
-              )
-            }
+            const isKnowledgeCard = segment.table === 'knowledge_card'
+            const cardTags = isKnowledgeCard && Array.isArray(segment.record.tags) ? segment.record.tags : []
+            const extraTags = cardExtraTags[bi] ?? []
+            const pendingTagsForCard = isKnowledgeCard
+              ? [...new Set([...cardTags, ...extraTags])].filter(name => !catalogNameSet.has(name))
+              : []
 
             return (
-              <SaveCard
-                key={i}
-                ref={el => { cardRefs.current[bi] = el }}
-                table={segment.table}
-                record={segment.record}
-                onSave={(table, fields) => handleSave(bi, table, fields)}
-                saveState={saveStates[bi] ?? { status: 'idle' }}
-                blocked={segment.table === 'knowledge_card' && !(
-                  segment.sourceRef != null
-                    ? sourceRefMap[segment.sourceRef]?.id
-                    : savedSourceIds[segment.sourceGroupIndex]
-                )}
-                validationWarnings={segment.validationWarnings ?? []}
-                unknownFields={segment.unknownFields ?? []}
-                contexts={segment.table === 'source' ? contexts : undefined}
-                forcedContext={segment.table === 'source' ? forcedContext : undefined}
-                sourceText={segment.table === 'knowledge_card'
-                  ? (segment.sourceRef != null
-                      ? sourceRefMap[segment.sourceRef]?.text
-                      : blocks[segment.sourceGroupIndex]?.record?.original_text)
-                  : undefined}
-                tagCatalog={tagCatalog}
-                proposedTagMeta={proposedTagMeta}
-                onNewTags={onNewTags}
-                linkState={segment.table === 'knowledge_card' ? (linkStates[bi] ?? { status: 'idle' }) : undefined}
-                onLink={segment.table === 'knowledge_card' ? (cardId) => handleLink(bi, cardId) : undefined}
-                annotatedSentence={editedAnnotatedSentences[bi] ?? segment.annotatedSentence}
-                onAnnotatedSentenceChange={value => updateAnnotatedSentence(bi, value)}
-              />
+              <div key={i} className="space-y-2">
+                {pendingTagsForCard.map(name => {
+                  const meta = proposedTagMeta[name] ?? {}
+                  const isConfirming = meta.confirming ?? false
+                  return (
+                    <div key={name} className="border border-amber-200 rounded-xl bg-amber-50 p-3 space-y-2 text-sm">
+                      <span className="text-xs font-semibold text-amber-700 uppercase tracking-wide">New tag</span>
+                      <div className="bg-white border border-amber-200 rounded-lg p-3 space-y-2">
+                        <div className="text-xs font-mono text-amber-800 bg-amber-100 border border-amber-300 px-2 py-1 rounded break-all">{name}</div>
+                        <input
+                          className="w-full text-xs border border-amber-200 rounded px-2 py-1.5 bg-white focus:outline-none focus:ring-1 focus:ring-amber-400 disabled:opacity-50"
+                          placeholder="display name…"
+                          value={meta.displayName ?? ''}
+                          onChange={e => updateProposedTagDisplayName(name, e.target.value)}
+                          disabled={isConfirming}
+                        />
+                        <button
+                          onClick={() => handleConfirmTag(name)}
+                          disabled={isConfirming}
+                          className={`w-full py-1.5 text-xs font-medium rounded-md transition-colors ${
+                            isConfirming
+                              ? 'bg-amber-300 text-amber-900 cursor-not-allowed'
+                              : 'bg-amber-500 text-white hover:bg-amber-600'
+                          }`}
+                        >
+                          {isConfirming ? 'Saving…' : 'Confirm'}
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+                <SaveCard
+                  ref={el => { cardRefs.current[bi] = el }}
+                  table={segment.table}
+                  record={segment.record}
+                  onSave={(table, fields) => handleSave(bi, table, fields)}
+                  saveState={saveStates[bi] ?? { status: 'idle' }}
+                  blocked={isKnowledgeCard && !(
+                    segment.sourceRef != null
+                      ? sourceRefMap[segment.sourceRef]?.id
+                      : savedSourceIds[segment.sourceGroupIndex]
+                  )}
+                  validationWarnings={segment.validationWarnings ?? []}
+                  unknownFields={segment.unknownFields ?? []}
+                  contexts={segment.table === 'source' ? contexts : undefined}
+                  forcedContext={segment.table === 'source' ? forcedContext : undefined}
+                  sourceText={isKnowledgeCard
+                    ? (segment.sourceRef != null
+                        ? sourceRefMap[segment.sourceRef]?.text
+                        : blocks[segment.sourceGroupIndex]?.record?.original_text)
+                    : undefined}
+                  tagCatalog={tagCatalog}
+                  proposedTagMeta={proposedTagMeta}
+                  onNewTags={onNewTags}
+                  onAddNewTag={isKnowledgeCard ? (name) => handleAddNewTag(bi, name) : undefined}
+                  linkState={isKnowledgeCard ? (linkStates[bi] ?? { status: 'idle' }) : undefined}
+                  onLink={isKnowledgeCard ? (cardId) => handleLink(bi, cardId) : undefined}
+                  annotatedSentence={editedAnnotatedSentences[bi] ?? segment.annotatedSentence}
+                  onAnnotatedSentenceChange={value => updateAnnotatedSentence(bi, value)}
+                />
+              </div>
             )
           }
           return null

@@ -31,11 +31,7 @@ export default async function handler(req, res) {
         contexts(id, name),
         source_knowledge(
           positions,
-          knowledge_cards(id, name, kind, tags, skill, importance)
-        ),
-        source_table_cells(
-          excerpt, note,
-          table_cells(id, cell_key, axis_values, skill, tables(id, name))
+          knowledge_cards(id, name, kind, tags, importance)
         )
       `)
       .eq('project_id', project_id)
@@ -55,7 +51,7 @@ export default async function handler(req, res) {
       id, original_text, created_at,
       contexts(id, name),
       source_knowledge(
-        knowledge_cards(id, name, kind, tags, skill, importance)
+        knowledge_cards(id, name, kind, tags, importance)
       )
     `, { count: 'exact' })
     .eq('project_id', project_id)

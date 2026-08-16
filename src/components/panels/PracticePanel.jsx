@@ -1,66 +1,184 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { apiFetch } from '../../apiFetch.js'
+import { MAX_EASIER_SENTENCE_ATTEMPTS } from '../../../lib/practiceRules.js'
 import PracticeMcCloze from '../PracticeMcCloze.jsx'
+import PracticeSpelling from '../PracticeSpelling.jsx'
 import PracticeExemplar from '../PracticeExemplar.jsx'
 import PracticeExplain from '../PracticeExplain.jsx'
+import { CardDetailPanel } from './CardDetailPanel.jsx'
 import { ChatPanel } from './ChatPanel.jsx'
 
-// Runs an ephemeral practice session over `practiceSession.cards` in `practiceSession.mode`.
+// Runs an ephemeral practice session over `practiceSession.skills` — a list of { card, type }
+// pairs (skills are the practice unit now, not cards, see lib/practiceRules.js and CLAUDE.md's
+// "Skills" section). Each skill's question shape (`current.mode`, one of
+// 'mc_cloze'/'spelling'/'exemplar') is decided server-side by the rule registry per request, not
+// fixed for the whole session — a mixed selection can freely interleave question types skill by
+// skill.
 // Nothing here persists — reload or close and the session is gone, by design (see CLAUDE.md /
 // practice-prototype-plan.md hard constraints).
 export function PracticePanel({ activeProject, practiceSession, onDragStart, onClose, onSidePanelCountChange, generatedContext, tagCatalog, onNewTags }) {
-  const { cards, mode } = practiceSession
+  const { skills } = practiceSession
   const [index, setIndex] = useState(0)
   const [current, setCurrent] = useState(null)
-  const [avoid, setAvoid] = useState([])
   const [sentenceCount, setSentenceCount] = useState(1)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [finished, setFinished] = useState(false)
-  // Two independent docked side panels — the "Why?"/"Explain" thread and the "Add source" chat —
-  // can be open together, each its own column (see render below).
+  // Three independent docked side panels — the "Why?"/"Explain" thread, the "Add source" chat, and
+  // the card panel (auto-opened once the current item is answered) — can be open together, each
+  // its own column (see render below).
   const [explain, setExplain] = useState(null) // { suggestion, context } | null
   const [addSource, setAddSource] = useState(null) // { sentence } | null
+  const [cardOpen, setCardOpen] = useState(false)
+  // card.id -> detail, filled in as prefetches resolve (see fetchCardDetail below) — keyed by
+  // id, and populated independently of `cardOpen`, so the docked panel's very first render already
+  // has the data instead of racing its own mount effect against ours.
+  const [cardDetails, setCardDetails] = useState({})
+  // { cardId, type, delta } | null — the +N/-N badge shown next to the just-answered skill's Level
+  // dots in the docked card panel, computed by diffing the level before/after recordPracticeResult
+  // lands. Cleared whenever the item changes so it doesn't linger on the wrong skill.
+  const [levelChange, setLevelChange] = useState(null)
+  // index -> { skill, correct } for every item actually answered this session (skipped items via
+  // the error state's "Skip" leave no entry) — drives EndOfSession's right/wrong coloring.
+  const [results, setResults] = useState({})
+  // How many times "Easier sentence" has been used on the item currently on screen (0 = never).
+  // Reset to 0 whenever `current` is replaced by a genuinely new item (loadCurrent, advance,
+  // handleNochEinSatz) — NOT reset by handleEasierSentence itself, since it counts attempts on
+  // the same underlying skill across regenerations. The button hides once this hits
+  // MAX_EASIER_SENTENCE_ATTEMPTS (lib/practiceRules.js — also the server-side clamp).
+  const [easierCount, setEasierCount] = useState(0)
+  // The raw (server-response-shape) items this skill's conversation has produced so far, oldest
+  // first — sent back as `history` on the next "Easier sentence" request so api/practice.js can
+  // replay this as a genuine multi-turn Anthropic conversation (see lib/practiceGenerate.js's
+  // `history` param) instead of a stateless one-shot regeneration that has no memory of what it
+  // just wrote. Always kept in sync 1:1 with easierCount (length === easierCount + 1 once an item
+  // is loaded) — reset alongside it at every same reset point.
+  const [itemHistory, setItemHistory] = useState([])
 
-  // Reports how many side panels are open (0/1/2) so PracticeMode.jsx can widen the box to fit
-  // them — a plain effect rather than calling this at every setExplain/setAddSource call site,
-  // since batched updates (e.g. advance() closing both at once) would otherwise report transient,
-  // stale-closure intermediate counts.
+  // Reports how many side panels are open (0/1/2/3) so PracticeMode.jsx can widen the box to fit
+  // them — a plain effect rather than calling this at every setExplain/setAddSource/setCardOpen
+  // call site, since batched updates (e.g. advance() closing all three at once) would otherwise
+  // report transient, stale-closure intermediate counts.
   useEffect(() => {
-    onSidePanelCountChange?.((explain ? 1 : 0) + (addSource ? 1 : 0))
+    onSidePanelCountChange?.((explain ? 1 : 0) + (addSource ? 1 : 0) + (cardOpen ? 1 : 0))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [explain, addSource])
+  }, [explain, addSource, cardOpen])
 
-  // While item n is on screen, prefetch.same (exemplar "Another sentence") and/or prefetch.next
-  // (the following card) are requested in the background — that's the whole latency strategy.
+  // While item n is on screen, prefetch.same (exemplar same-card resentence — currently unused by
+  // any button, see PracticeExemplar.jsx) and/or prefetch.next (the following skill) are requested
+  // in the background — that's the whole latency strategy.
   const prefetchRef = useRef({})
   const sessionKeyRef = useRef(0)
+  // card.id -> Promise<detail|null> — the card panel's own fetch, kept separate from the
+  // question-item prefetch above. Started as soon as an item loads (see effect below), well
+  // before the user answers, so by the time the panel auto-opens the data is already there.
+  const cardDetailCacheRef = useRef({})
 
-  const card = cards[index]
+  const skill = skills[index]
+  // The skill actually generated for the item on screen — usually `skill`, but can differ after a
+  // silent server-side substitution (see requestItem's comment above). Everything downstream of
+  // the current item (result recording, Explain, the card panel) should use this, not `skill`.
+  const effectiveSkill = current?.skill ?? skill
+  const card = effectiveSkill?.card
 
-  const requestItem = useCallback(async (targetCard, avoidList) => {
+  // Fetches (or re-fetches) a card's full detail behind the auto-shown card panel, stashing it in
+  // `cardDetails` by card id as soon as it resolves — independent of whether the panel is open
+  // yet. By default idempotent/cached (a re-request for the same card, e.g. two skills on one card
+  // back to back, is free); `force: true` bypasses the cache — used right after a practice result
+  // is recorded, since the prefetched detail was fetched *before* the level bump and would
+  // otherwise show a stale (pre-answer) level in the panel. Returns the detail (or the in-flight
+  // promise for it) so callers can chain off the fresh value, e.g. to diff a level before/after.
+  const fetchCardDetail = useCallback((targetCard, { force = false } = {}) => {
+    if (!targetCard || !activeProject) return Promise.resolve(null)
+    if (!force && cardDetailCacheRef.current[targetCard.id]) return cardDetailCacheRef.current[targetCard.id]
+    const p = apiFetch(`/api/knowledge-cards?${new URLSearchParams({ project_id: activeProject.id, id: targetCard.id })}`)
+      .then(r => r.ok ? r.json() : null)
+      .catch(() => null)
+      .then(detail => {
+        setCardDetails(prev => ({ ...prev, [targetCard.id]: detail }))
+        return detail
+      })
+    cardDetailCacheRef.current[targetCard.id] = p
+    return p
+  }, [activeProject?.id])
+
+  // Fired from handleAnswered with the just-answered correctness (right/wrong/don't know) —
+  // bumps the skill's level by one step (floor 1, ceiling 10) server-side (api/knowledge-cards.js),
+  // which also stamps last_correct, but only when the attempt was actually correct. Fire-and-forget:
+  // a failed bookkeeping write shouldn't block moving on to the next item. Once it lands, force a
+  // fresh card-detail fetch so the auto-shown panel picks up the new level instead of the
+  // pre-answer one it was prefetched with, and diff against `beforeLevel` (the level as of the
+  // moment the answer was given — see handleAnswered) to drive the +N/-N badge.
+  const recordPracticeResult = useCallback((targetSkill, correct, beforeLevel) => {
+    apiFetch(`/api/knowledge-cards?${new URLSearchParams({ project_id: activeProject.id, id: targetSkill.card.id })}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ skill_type: targetSkill.type, practice_result: correct ? 'correct' : 'incorrect' }),
+    })
+      .then(() => fetchCardDetail(targetSkill.card, { force: true }))
+      .then(detail => {
+        const afterLevel = detail?.skill?.find(s => s.type === targetSkill.type)?.level ?? null
+        if (beforeLevel == null || afterLevel == null || afterLevel === beforeLevel) return
+        setLevelChange({ cardId: targetSkill.card.id, type: targetSkill.type, delta: afterLevel - beforeLevel })
+      })
+      .catch(e => console.error('[practice] failed to record result', e))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.id])
+
+  // `history`/`problemType`, if given, continue an existing "Easier sentence" conversation for
+  // this exact skill (see handleEasierSentence below) — `history` is the ordered list of raw
+  // items (server-response shape) already produced this chain, `problemType` pins which problem
+  // type it committed to (api/practice.js's resolvePracticeRule uses it to avoid re-rolling a
+  // different one mid-chain). Both omitted for an ordinary fresh generation.
+  const requestItem = useCallback(async (targetSkill, { history = [], problemType } = {}) => {
     const res = await apiFetch('/api/practice', {
       method: 'POST',
-      body: JSON.stringify({ project_id: activeProject.id, card_id: targetCard.id, mode, avoid: avoidList }),
+      body: JSON.stringify({
+        project_id: activeProject.id,
+        card_id: targetSkill.card.id,
+        skill_type: targetSkill.type,
+        history: history.length ? history : undefined,
+        problem_type: problemType,
+      }),
     })
     const body = await res.json().catch(() => ({}))
     if (!res.ok) throw new Error(body.error || 'Failed to generate item')
     // body.request is the exact { model, system, messages } api/practice.js sent to Anthropic —
-    // the client only ever sends a card_id/mode/avoid, so this is the only place the real prompt
-    // text (card context, task instructions) is visible; log that, not the request we made.
+    // the client only ever sends a card_id/skill_type, so this is the only place the real
+    // prompt text (card context, task instructions) is visible; log that, not the request we made.
     console.log('[LLM request]', JSON.stringify(body.request, null, 2))
     console.log('[LLM response]', JSON.stringify(body.item, null, 2))
-    return body.item
-  }, [activeProject?.id, mode])
+    // body.mode is the question type the rule registry picked for this skill (lib/practiceRules.js)
+    // — stash it on the item itself since it can differ skill to skill within one session.
+    // body.card/body.skill_type are what api/practice.js ACTUALLY generated for — the requested
+    // skill_type may have had no problem type configured, in which case the server silently
+    // substituted a different skill (see lib/practiceRules.js's practiceableSkillTypes()). Stash
+    // that as `skill` on the item so result recording / Explain / the card panel act on the real
+    // thing, not on targetSkill.
+    // seed: { offered, used } — the "other vocabulary already known" pool offered to the model
+    // (body.seed_card_names) vs. what it reports actually using (item.used_seed_words) — shown in
+    // the auto-opened card panel alongside the skill tested.
+    // rawItem/problemType are kept alongside the displayable item so handleEasierSentence can
+    // extend itemHistory and pin the chain's problemType on the next continuation request.
+    return {
+      ...body.item,
+      mode: body.mode,
+      problemType: body.problem_type,
+      rawItem: body.item,
+      skill: { card: body.card ?? targetSkill.card, type: body.skill_type ?? targetSkill.type },
+      seed: { offered: body.seed_card_names ?? [], used: body.item?.used_seed_words ?? [] },
+    }
+  }, [activeProject?.id])
 
-  const loadCurrent = useCallback(async (targetIndex, avoidList) => {
+  const loadCurrent = useCallback(async (targetIndex) => {
     setLoading(true)
     setError(null)
     const mySession = sessionKeyRef.current
     try {
-      const item = await requestItem(cards[targetIndex], avoidList)
+      const item = await requestItem(skills[targetIndex])
       if (sessionKeyRef.current !== mySession) return
       setCurrent(item)
+      setEasierCount(0)
+      setItemHistory([item.rawItem])
     } catch (e) {
       if (sessionKeyRef.current !== mySession) return
       setError(e.message)
@@ -68,33 +186,41 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     } finally {
       if (sessionKeyRef.current === mySession) setLoading(false)
     }
-  }, [cards, requestItem])
+  }, [skills, requestItem])
 
   // (Re)start whenever a new session is handed in (new selection, or "Practice again").
   useEffect(() => {
     sessionKeyRef.current += 1
     prefetchRef.current = {}
+    cardDetailCacheRef.current = {}
     setIndex(0)
-    setAvoid([])
     setSentenceCount(1)
     setFinished(false)
     setCurrent(null)
     setExplain(null)
     setAddSource(null)
-    loadCurrent(0, [])
+    setCardOpen(false)
+    setCardDetails({})
+    setLevelChange(null)
+    setResults({})
+    setEasierCount(0)
+    setItemHistory([])
+    loadCurrent(0)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [practiceSession])
 
-  // Prefetch the likely next request(s) while the current item is being looked at.
+  // Prefetch the likely next request(s) while the current item is being looked at — and the
+  // current item's own card detail, well ahead of the answer that will reveal it.
   useEffect(() => {
     if (!current || finished) return
-    if (mode === 'exemplar') {
-      prefetchRef.current.same = requestItem(card, [...avoid, current.sense_key]).catch(e => ({ __error: e.message }))
+    if (current.mode === 'exemplar') {
+      prefetchRef.current.same = requestItem(current.skill ?? skill).catch(e => ({ __error: e.message }))
     }
     const nextIndex = index + 1
-    if (nextIndex < cards.length) {
-      prefetchRef.current.next = requestItem(cards[nextIndex], []).catch(e => ({ __error: e.message }))
+    if (nextIndex < skills.length) {
+      prefetchRef.current.next = requestItem(skills[nextIndex]).catch(e => ({ __error: e.message }))
     }
+    fetchCardDetail(current.skill?.card ?? skill?.card)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current])
 
@@ -104,25 +230,42 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     return result?.__error ? null : result
   }
 
+  // Fired the moment an item is answered — an option picked, "Don't know", a spelling submitted,
+  // or exemplar's "Got it" — not at "Next". The skill update (and the right/wrong record used by
+  // EndOfSession) has to land right away, before the user might close the panel without ever
+  // clicking Next. `beforeLevel` is read from whatever's cached *right now*, before the PATCH —
+  // if the prefetch hasn't resolved yet, it's null and no delta badge is shown (rather than a
+  // misleading one), same fallback recordPracticeResult already applies.
+  function handleAnswered(correct) {
+    setCardOpen(true)
+    setLevelChange(null)
+    const beforeLevel = cardDetails[effectiveSkill.card.id]?.skill?.find(s => s.type === effectiveSkill.type)?.level ?? null
+    recordPracticeResult(effectiveSkill, correct, beforeLevel)
+    setResults(prev => ({ ...prev, [index]: { skill: effectiveSkill, correct } }))
+  }
+
   async function advance() {
     setExplain(null)
     setAddSource(null)
+    setCardOpen(false)
+    setLevelChange(null)
     const nextIndex = index + 1
-    if (nextIndex >= cards.length) {
+    if (nextIndex >= skills.length) {
       setFinished(true)
       return
     }
     const prefetched = await resolvePrefetch(prefetchRef.current.next)
     prefetchRef.current = {}
     setIndex(nextIndex)
-    setAvoid([])
     setSentenceCount(1)
     if (prefetched) {
       setCurrent(prefetched)
+      setEasierCount(0)
+      setItemHistory([prefetched.rawItem])
       setError(null)
       setLoading(false)
     } else {
-      loadCurrent(nextIndex, [])
+      loadCurrent(nextIndex)
     }
   }
 
@@ -132,38 +275,80 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     // about to disappear, so it must go too. The Explain thread is untouched: re-explaining the
     // same card across sentences is intentionally allowed to persist (see PracticeExplain.jsx).
     setAddSource(null)
-    const newAvoid = [...avoid, current.sense_key]
     const prefetched = await resolvePrefetch(prefetchRef.current.same)
     prefetchRef.current.same = null
-    setAvoid(newAvoid)
     setSentenceCount(c => c + 1)
     if (prefetched) {
       setCurrent(prefetched)
+      setEasierCount(0)
+      setItemHistory([prefetched.rawItem])
       setError(null)
       setLoading(false)
     } else {
-      loadCurrent(index, newAvoid)
+      loadCurrent(index)
     }
   }
 
   function handleRestart() {
     sessionKeyRef.current += 1
     prefetchRef.current = {}
+    cardDetailCacheRef.current = {}
     setIndex(0)
-    setAvoid([])
     setSentenceCount(1)
     setFinished(false)
-    loadCurrent(0, [])
+    setCardOpen(false)
+    setCardDetails({})
+    setLevelChange(null)
+    setResults({})
+    setEasierCount(0)
+    setItemHistory([])
+    loadCurrent(0)
+  }
+
+  // Regenerates the item currently on screen for the exact same skill, continuing this skill's
+  // conversation (itemHistory) with a request for easier surrounding vocabulary — a genuine
+  // multi-turn continuation, not a fresh one-shot regeneration, so the model can react to exactly
+  // what it wrote last turn instead of being told about a "previous attempt" it has no memory of
+  // (see lib/practiceGenerate.js's `history` param / easierTurnText, and api/practice.js's
+  // resolvePracticeRule which pins the chain's problemType so it can't drift mid-conversation).
+  // Closes the explain/add-source side panels since both are about the sentence that's about to
+  // disappear (same reasoning as handleNochEinSatz). Capped client-side at
+  // MAX_EASIER_SENTENCE_ATTEMPTS; each Practice*.jsx component hides its own button once
+  // `easierCount` reaches that cap (the server clamps `history` length too, independently).
+  async function handleEasierSentence() {
+    if (!current || easierCount >= MAX_EASIER_SENTENCE_ATTEMPTS) return
+    setExplain(null)
+    setAddSource(null)
+    setLoading(true)
+    setError(null)
+    const mySession = sessionKeyRef.current
+    try {
+      const item = await requestItem(effectiveSkill, { history: itemHistory, problemType: current.problemType })
+      if (sessionKeyRef.current !== mySession) return
+      setCurrent(item)
+      setEasierCount(c => c + 1)
+      setItemHistory(prev => [...prev, item.rawItem])
+    } catch (e) {
+      if (sessionKeyRef.current !== mySession) return
+      setError(e.message)
+    } finally {
+      if (sessionKeyRef.current === mySession) setLoading(false)
+    }
   }
 
   function handleExplain() {
     if (!current || !card) return
-    const suggestion = mode === 'mc_cloze'
-      ? `Why is "${current.answer}" correct here?`
-      : `Can you explain "${card.name}" in this sentence?`
-    const context = mode === 'mc_cloze'
-      ? `Sentence: ${current.sentence}\nOptions: ${current.options.join(', ')}\nPracticing: ${card.name}`
-      : `Sentence: ${current.sentence}\nPracticing: ${card.name}`
+    let suggestion, context
+    if (current.mode === 'mc_cloze') {
+      suggestion = `Why is "${current.answer}" correct here?`
+      context = `Sentence: ${current.sentence}\nOptions: ${current.options.join(', ')}\nPracticing: ${card.name}`
+    } else if (current.mode === 'spelling') {
+      suggestion = `Why is "${current.answer}" correct here?`
+      context = `Sentence: ${current.sentence}\nPracticing: ${card.name}`
+    } else {
+      suggestion = `Can you explain "${card.name}" in this sentence?`
+      context = `Sentence: ${current.sentence}\nPracticing: ${card.name}`
+    }
     setExplain({ suggestion, context })
   }
 
@@ -171,11 +356,13 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     if (!current) return
     // The Add-source chat never sees the multiple-choice question — just the complete sentence,
     // blank filled in with the correct answer (exemplar items have no blank to begin with).
-    const sentence = mode === 'mc_cloze' ? current.sentence.replace('___', current.answer) : current.sentence
+    const sentence = current.mode === 'mc_cloze' || current.mode === 'spelling'
+      ? current.sentence.replace('___', current.answer)
+      : current.sentence
     setAddSource({ sentence })
   }
 
-  const total = cards.length
+  const total = skills.length
   const progress = `${Math.min(index + 1, total)} / ${total}`
 
   return (
@@ -190,7 +377,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
             {!finished && card && (
               <div className="flex items-center gap-1.5 mt-0.5">
                 <span className="text-[10px] text-gray-400 shrink-0">{progress}</span>
-                {mode === 'exemplar' && (
+                {current?.mode === 'exemplar' && (
                   <span className="flex items-center gap-0.5 shrink-0" title={`${sentenceCount} sentence${sentenceCount > 1 ? 's' : ''} for this card`}>
                     {Array.from({ length: sentenceCount }).map((_, i) => (
                       <span key={i} className="w-1 h-1 rounded-full bg-blue-400" />
@@ -217,7 +404,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
 
         <div className="flex-1 min-h-0 overflow-hidden">
           {finished ? (
-            <EndOfSession cards={cards} onRestart={handleRestart} />
+            <EndOfSession skills={skills} results={results} onRestart={handleRestart} />
           ) : loading ? (
             <div className="h-full flex items-center justify-center">
               <p className="text-xs text-gray-400">Generating…</p>
@@ -227,7 +414,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
               <p className="text-xs text-red-500">{error || "Couldn't generate a valid item."}</p>
               <div className="flex gap-2">
                 <button
-                  onClick={() => loadCurrent(index, avoid)}
+                  onClick={() => loadCurrent(index)}
                   className="text-xs px-2.5 py-1 rounded border border-gray-300 text-gray-600 hover:bg-gray-50 transition-colors"
                 >
                   Retry
@@ -240,10 +427,12 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
                 </button>
               </div>
             </div>
-          ) : current && mode === 'mc_cloze' ? (
-            <PracticeMcCloze item={current} onWeiter={advance} onExplain={handleExplain} onAddSource={handleAddSource} addSourceDisabled={!generatedContext} />
-          ) : current && mode === 'exemplar' ? (
-            <PracticeExemplar item={current} onVerstanden={advance} onNochEinSatz={handleNochEinSatz} onExplain={handleExplain} onAddSource={handleAddSource} addSourceDisabled={!generatedContext} />
+          ) : current && current.mode === 'mc_cloze' ? (
+            <PracticeMcCloze item={current} onWeiter={advance} onAnswered={handleAnswered} onExplain={handleExplain} onAddSource={handleAddSource} addSourceDisabled={!generatedContext} onEasierSentence={handleEasierSentence} easierCount={easierCount} maxEasierAttempts={MAX_EASIER_SENTENCE_ATTEMPTS} />
+          ) : current && current.mode === 'spelling' ? (
+            <PracticeSpelling item={current} onWeiter={advance} onAnswered={handleAnswered} onExplain={handleExplain} onAddSource={handleAddSource} addSourceDisabled={!generatedContext} onEasierSentence={handleEasierSentence} easierCount={easierCount} maxEasierAttempts={MAX_EASIER_SENTENCE_ATTEMPTS} />
+          ) : current && current.mode === 'exemplar' ? (
+            <PracticeExemplar item={current} onAnswered={handleAnswered} onNext={advance} onNochEinSatz={handleNochEinSatz} onExplain={handleExplain} onAddSource={handleAddSource} addSourceDisabled={!generatedContext} onEasierSentence={handleEasierSentence} easierCount={easierCount} maxEasierAttempts={MAX_EASIER_SENTENCE_ATTEMPTS} />
           ) : null}
         </div>
       </div>
@@ -266,6 +455,20 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
           onClose={() => setAddSource(null)}
           sentence={addSource.sentence}
         />
+      )}
+
+      {cardOpen && card && (
+        <div className="w-80 sm:w-96 shrink-0 border-l bg-white flex flex-col h-full min-w-0">
+          <CardDetailPanel
+            card={card}
+            activeProject={activeProject}
+            onClose={() => setCardOpen(false)}
+            highlightSkillType={effectiveSkill?.type}
+            prefetchedDetail={cardDetails[card.id] ?? null}
+            levelChange={levelChange?.cardId === card.id ? levelChange : null}
+            seedInfo={current?.seed ?? null}
+          />
+        </div>
       )}
     </div>
   )
@@ -298,17 +501,33 @@ function AddSourceChat({ activeProject, forcedContext, tagCatalog, onNewTags, on
   )
 }
 
-function EndOfSession({ cards, onRestart }) {
+// `results` is index -> { skill, correct } (see PracticePanel's own state) — a missing entry
+// (item skipped via the error state's "Skip") renders neutral, not wrong. `result.skill`, not the
+// original `skills[i]`, is what's actually displayed, since a silent server-side substitution
+// (see requestItem's comment above) can mean the skill actually assessed at that index differs
+// from the one originally requested.
+function EndOfSession({ skills, results, onRestart }) {
   return (
     <div className="h-full flex flex-col items-center justify-center gap-4 px-6 text-center">
       <div>
         <p className="text-sm font-medium text-gray-800">Session complete</p>
-        <p className="text-xs text-gray-400 mt-1">{cards.length} card{cards.length > 1 ? 's' : ''} covered</p>
+        <p className="text-xs text-gray-400 mt-1">{skills.length} skill{skills.length > 1 ? 's' : ''} covered</p>
       </div>
       <div className="flex flex-wrap gap-1 justify-center max-w-xs">
-        {cards.map(c => (
-          <span key={c.id} className="text-[10px] bg-gray-100 text-gray-600 rounded px-1.5 py-0.5">{c.name}</span>
-        ))}
+        {skills.map((s, i) => {
+          const result = results?.[i]
+          const displaySkill = result?.skill ?? s
+          const colorClass = !result
+            ? 'bg-gray-100 text-gray-600'
+            : result.correct
+              ? 'bg-green-100 text-green-700'
+              : 'bg-red-100 text-red-700'
+          return (
+            <span key={`${s.card.id}-${s.type}-${i}`} className={`text-[10px] rounded px-1.5 py-0.5 ${colorClass}`}>
+              {displaySkill.card.name} · {displaySkill.type}
+            </span>
+          )
+        })}
       </div>
       <button
         onClick={onRestart}

@@ -15,7 +15,6 @@ const KIND_COLORS = {
   vocabulary: 'bg-green-100 text-green-700',
   grammar: 'bg-purple-100 text-purple-700',
   expression: 'bg-orange-100 text-orange-700',
-  table: 'bg-blue-100 text-blue-700',
 }
 
 // Derives the display excerpt from positions + original_text.
@@ -27,7 +26,7 @@ function deriveExcerpt(text, positions) {
     .join(' … ')
 }
 
-export function SourceDetailPanel({ source, activeProject, onClose, onAppendToChat, onDragStart, onSelectTable }) {
+export function SourceDetailPanel({ source, activeProject, onClose, onAppendToChat, onDragStart }) {
   const [selectedCardId, setSelectedCardId] = useState(null)
   const [hoveredCardId, setHoveredCardId] = useState(null)
   const [hoveredCharIndex, setHoveredCharIndex] = useState(null)
@@ -48,10 +47,6 @@ export function SourceDetailPanel({ source, activeProject, onClose, onAppendToCh
   const positionsByCardId = new Map(
     (detail?.source_knowledge ?? []).map(sk => [sk.knowledge_cards?.id, sk.positions ?? []])
   )
-
-  const tableCellLinks = (detail?.source_table_cells ?? [])
-    .map(link => link.table_cells ? { ...link, cell: link.table_cells } : null)
-    .filter(Boolean)
 
   const sourceKnowledge = source?.source_knowledge ?? []
   const cards = sourceKnowledge.map(sk => ({
@@ -192,20 +187,6 @@ export function SourceDetailPanel({ source, activeProject, onClose, onAppendToCh
                           </div>
                         )}
 
-                        {card.skill != null && (
-                          <div className="flex items-center gap-1.5 mt-2">
-                            <span className="text-[10px] text-gray-400">Skill</span>
-                            <div className="flex gap-0.5">
-                              {Array.from({ length: 10 }, (_, i) => (
-                                <div
-                                  key={i}
-                                  className={`w-2 h-2 rounded-sm ${i < card.skill ? 'bg-blue-500' : 'bg-gray-200'}`}
-                                />
-                              ))}
-                            </div>
-                            <span className="text-[10px] text-gray-500">{card.skill}/10</span>
-                          </div>
-                        )}
                       </button>
                     )
                   })}
@@ -216,54 +197,8 @@ export function SourceDetailPanel({ source, activeProject, onClose, onAppendToCh
               </div>
             )}
 
-            {cards.length === 0 && tableCellLinks.length === 0 && (
+            {cards.length === 0 && (
               <p className="text-xs text-gray-400">No knowledge cards linked to this source.</p>
-            )}
-
-            {tableCellLinks.length > 0 && (
-              <div className={cards.length > 0 ? 'mt-4' : ''}>
-                <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-2">
-                  Table cells ({tableCellLinks.length})
-                </p>
-                <div className="space-y-2">
-                  {tableCellLinks.map((link, i) => (
-                    <button
-                      key={i}
-                      onClick={() => link.cell.tables && onSelectTable?.(link.cell.tables)}
-                      className="w-full text-left border border-gray-200 rounded-lg p-3 bg-white hover:border-gray-300 transition-colors"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <span className="text-sm font-medium text-gray-800">{link.cell.tables?.name}</span>
-                        <span className={`text-[10px] rounded px-1.5 py-0.5 font-medium shrink-0 ${KIND_COLORS.table}`}>
-                          table
-                        </span>
-                      </div>
-                      <div className="flex flex-wrap gap-1 mt-1.5">
-                        {Object.entries(link.cell.axis_values ?? {}).map(([axis, val]) => (
-                          <span key={axis} className="text-[10px] bg-gray-100 text-gray-500 rounded px-1.5 py-0.5 font-mono">{axis}: {val}</span>
-                        ))}
-                      </div>
-                      {link.excerpt && (
-                        <p className="text-[11px] text-gray-400 mt-1 font-mono">{link.excerpt}</p>
-                      )}
-                      {link.note && (
-                        <p className="text-[11px] text-gray-500 mt-1">{link.note}</p>
-                      )}
-                      {link.cell.skill != null && (
-                        <div className="flex items-center gap-1.5 mt-2">
-                          <span className="text-[10px] text-gray-400">Skill</span>
-                          <div className="flex gap-0.5">
-                            {Array.from({ length: 10 }, (_, i) => (
-                              <div key={i} className={`w-2 h-2 rounded-sm ${i < link.cell.skill ? 'bg-blue-500' : 'bg-gray-200'}`} />
-                            ))}
-                          </div>
-                          <span className="text-[10px] text-gray-500">{link.cell.skill}/10</span>
-                        </div>
-                      )}
-                    </button>
-                  ))}
-                </div>
-              </div>
             )}
           </div>
         </div>

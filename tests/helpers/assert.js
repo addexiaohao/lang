@@ -6,7 +6,7 @@ export class AssertionError extends Error {
   }
 }
 
-const VALID_KINDS = ['vocabulary', 'grammar', 'expression', 'table']
+const VALID_KINDS = ['vocabulary', 'grammar', 'expression']
 
 // Format checks — run on every emitted block regardless of test case.
 // These are hard failures: malformed output is never acceptable.
@@ -35,16 +35,10 @@ export function assertValidFormat(blocks) {
         throw new AssertionError(`save:knowledge_card invalid kind "${parsed.kind}"`, parsed)
       if (!parsed.name)
         throw new AssertionError('save:knowledge_card missing required field: name', parsed)
-      if (parsed.skill !== undefined && (parsed.skill < 1 || parsed.skill > 10))
-        throw new AssertionError(`save:knowledge_card skill out of range: ${parsed.skill}`, parsed)
       if (parsed.importance !== undefined && (parsed.importance < 1 || parsed.importance > 10))
         throw new AssertionError(`save:knowledge_card importance out of range: ${parsed.importance}`, parsed)
       if (parsed.tags !== undefined && !Array.isArray(parsed.tags))
         throw new AssertionError('save:knowledge_card tags must be an array', parsed)
-      if (parsed.kind === 'table' && parsed.skill !== undefined)
-        throw new AssertionError('save:knowledge_card table kind must not have top-level skill', parsed)
-      if (parsed.kind === 'table' && !Array.isArray(parsed.axes))
-        throw new AssertionError('save:knowledge_card table kind must have axes array', parsed)
 
       const tags = parsed.tags ?? []
       if (tags.includes('plural-only')) {

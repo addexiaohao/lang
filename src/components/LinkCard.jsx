@@ -60,10 +60,9 @@ const LinkCard = forwardRef(function LinkCard({ record, linkState = { status: 'i
             ))}
           </div>
         )}
-        {(record.skill != null || record.importance != null) && (
+        {record.importance != null && (
           <div className="flex gap-3 text-xs text-gray-500">
-            {record.skill != null && <span>skill: {record.skill}</span>}
-            {record.importance != null && <span>importance: {record.importance}</span>}
+            <span>importance: {record.importance}</span>
           </div>
         )}
       </div>

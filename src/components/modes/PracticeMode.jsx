@@ -12,7 +12,7 @@ import { CardsPanel } from '../panels/CardsPanel.jsx'
 // (onStartPractice) is unchanged either way.
 export function PracticeMode({
   activeProject, practiceSession, onStartPractice, onEndSession,
-  onSelectCard, onSelectTable, peekCardId, peekTableId,
+  onSelectCard, peekCardId,
   generatedContext, tagCatalog, onNewTags,
 }) {
   const [browsing, setBrowsing] = useState(false)
@@ -45,8 +45,6 @@ export function PracticeMode({
               activeProject={activeProject}
               onSelectCard={onSelectCard}
               selectedCardId={peekCardId}
-              onSelectTable={onSelectTable}
-              selectedTableId={peekTableId}
               onClose={() => setBrowsing(false)}
               onStartPractice={onStartPractice}
             />

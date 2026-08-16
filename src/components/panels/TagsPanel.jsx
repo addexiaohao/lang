@@ -9,20 +9,6 @@ const KIND_COLORS = {
   expression: 'text-green-600 bg-green-50',
 }
 
-function SkillBar({ skill }) {
-  if (skill == null) return null
-  return (
-    <div className="flex items-center gap-1">
-      {Array.from({ length: 10 }, (_, i) => (
-        <div
-          key={i}
-          className={`h-1 w-2 rounded-sm ${i < skill ? 'bg-blue-400' : 'bg-gray-200'}`}
-        />
-      ))}
-    </div>
-  )
-}
-
 export function TagsPanel({ activeProject, tagCatalog, onNewTags, onDragStart, onClose, selectedTag, onSelectTag, onSelectCard, selectedCardId }) {
   const [cards, setCards] = useState([])
   const [total, setTotal] = useState(0)
@@ -35,6 +21,48 @@ export function TagsPanel({ activeProject, tagCatalog, onNewTags, onDragStart, o
   const [newTagDisplayName, setNewTagDisplayName] = useState('')
   const [creatingTag, setCreatingTag] = useState(false)
   const [createTagError, setCreateTagError] = useState(null)
+
+  const [editingTagId, setEditingTagId] = useState(null)
+  const [editName, setEditName] = useState('')
+  const [editDisplayName, setEditDisplayName] = useState('')
+  const [savingEdit, setSavingEdit] = useState(false)
+  const [editError, setEditError] = useState(null)
+
+  function startEditTag(tag) {
+    setEditingTagId(tag.id)
+    setEditName(tag.name)
+    setEditDisplayName(tag.display_name ?? '')
+    setEditError(null)
+  }
+
+  function cancelEditTag() {
+    setEditingTagId(null)
+    setEditError(null)
+  }
+
+  async function handleSaveTagEdit(e, tagId) {
+    e.preventDefault()
+    if (!editName.trim()) return
+    setSavingEdit(true)
+    setEditError(null)
+    try {
+      const res = await apiFetch(`/api/tags?id=${tagId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          name: editName.trim(),
+          display_name: editDisplayName.trim(),
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? 'Failed to update tag')
+      onNewTags?.()
+      setEditingTagId(null)
+    } catch (err) {
+      setEditError(err.message)
+    } finally {
+      setSavingEdit(false)
+    }
+  }
 
   async function handleCreateTag(e) {
     e.preventDefault()
@@ -184,31 +212,82 @@ export function TagsPanel({ activeProject, tagCatalog, onNewTags, onDragStart, o
             <p className="text-xs text-gray-400 text-center mt-8">No tags yet.</p>
           )}
           {[...tagCatalog].sort((a, b) => a.name.localeCompare(b.name)).map(tag => (
-            <button
-              key={tag.id}
-              onClick={() => handleTagClick(tag.name)}
-              className="w-full text-left px-3 py-2.5 border-b border-gray-100 hover:bg-gray-50 transition-colors group"
-            >
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-sm text-gray-800 font-medium truncate">
-                  {tag.name}
-                  {tag.display_name && (
-                    <span className="ml-1.5 text-[11px] font-normal text-gray-400">{tag.display_name}</span>
-                  )}
-                </span>
-                <span className="text-[10px] text-gray-400 shrink-0">
-                  {tag.card_count ?? 0} card{tag.card_count === 1 ? '' : 's'}
-                </span>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
-                  strokeLinecap="round" strokeLinejoin="round"
-                  className="w-3 h-3 text-gray-300 group-hover:text-gray-400 shrink-0">
-                  <polyline points="9 18 15 12 9 6" />
-                </svg>
+            editingTagId === tag.id ? (
+              <div key={tag.id} className="px-3 py-2.5 border-b border-gray-100 bg-gray-50">
+                <form onSubmit={e => handleSaveTagEdit(e, tag.id)} className="space-y-2">
+                  <input
+                    className="w-full text-sm border border-gray-300 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                    placeholder="Internal name"
+                    value={editName}
+                    onChange={e => setEditName(e.target.value)}
+                    disabled={savingEdit}
+                    autoFocus
+                  />
+                  <input
+                    className="w-full text-sm border border-gray-300 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400"
+                    placeholder="Display name"
+                    value={editDisplayName}
+                    onChange={e => setEditDisplayName(e.target.value)}
+                    disabled={savingEdit}
+                  />
+                  <div className="flex gap-2">
+                    <button
+                      type="submit"
+                      disabled={savingEdit || !editName.trim()}
+                      className="flex-1 px-3 py-1.5 rounded-lg bg-blue-500 text-white text-sm hover:bg-blue-600 disabled:opacity-40 transition-colors"
+                    >
+                      {savingEdit ? 'Saving…' : 'Save'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={cancelEditTag}
+                      className="px-3 py-1.5 rounded-lg text-gray-500 text-sm hover:bg-gray-100 transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  {editError && <p className="text-xs text-red-500">{editError}</p>}
+                </form>
               </div>
-              {tag.description && (
-                <p className="text-[11px] text-gray-400 mt-0.5 leading-snug">{tag.description}</p>
-              )}
-            </button>
+            ) : (
+              <div
+                key={tag.id}
+                className="w-full text-left px-3 py-2.5 border-b border-gray-100 hover:bg-gray-50 transition-colors group flex items-start"
+              >
+                <button onClick={() => handleTagClick(tag.name)} className="flex-1 min-w-0 text-left">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-sm text-gray-800 font-medium truncate">
+                      {tag.name}
+                      {tag.display_name && (
+                        <span className="ml-1.5 text-[11px] font-normal text-gray-400">{tag.display_name}</span>
+                      )}
+                    </span>
+                    <span className="text-[10px] text-gray-400 shrink-0">
+                      {tag.card_count ?? 0} card{tag.card_count === 1 ? '' : 's'}
+                    </span>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+                      strokeLinecap="round" strokeLinejoin="round"
+                      className="w-3 h-3 text-gray-300 group-hover:text-gray-400 shrink-0">
+                      <polyline points="9 18 15 12 9 6" />
+                    </svg>
+                  </div>
+                  {tag.description && (
+                    <p className="text-[11px] text-gray-400 mt-0.5 leading-snug">{tag.description}</p>
+                  )}
+                </button>
+                <button
+                  onClick={() => startEditTag(tag)}
+                  aria-label="Edit tag"
+                  title="Edit tag"
+                  className="ml-2 mt-0.5 shrink-0 text-gray-300 hover:text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity"
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+                    strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
+                    <path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
+                  </svg>
+                </button>
+              </div>
+            )
           ))}
         </div>
       </div>
@@ -277,11 +356,6 @@ export function TagsPanel({ activeProject, tagCatalog, onNewTags, onDragStart, o
                   {card.kind}
                 </span>
               </div>
-              {card.skill != null && (
-                <div className="mt-1.5">
-                  <SkillBar skill={card.skill} />
-                </div>
-              )}
               {card.tags && card.tags.length > 0 && (
                 <div className="flex flex-wrap gap-1 mt-1.5">
                   {card.tags.filter(t => t !== selectedTag).map(t => (

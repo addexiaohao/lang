@@ -10,7 +10,6 @@ import { ChatDock } from './components/ChatDock.jsx'
 import { Overlay } from './components/Overlay.jsx'
 import { ChatPanel } from './components/panels/ChatPanel.jsx'
 import { CardDetailPanel } from './components/panels/CardDetailPanel.jsx'
-import { TableDetailPanel } from './components/panels/TableDetailPanel.jsx'
 import { TagsPanel } from './components/panels/TagsPanel.jsx'
 import { LibraryMode, LIBRARY_DEFAULT_WIDTHS } from './components/modes/LibraryMode.jsx'
 import { PracticeMode } from './components/modes/PracticeMode.jsx'
@@ -52,7 +51,6 @@ export default function App() {
   // card peek overlay's "Open in Library" hand-off can reach into it.
   const [selectedSource, setSelectedSource] = useState(null)
   const [selectedCard, setSelectedCard] = useState(null)
-  const [selectedTable, setSelectedTable] = useState(null)
   const [selectedTag, setSelectedTag] = useState(null)
 
   // Practice session is deliberately NOT persisted to localStorage — see PracticePanel.jsx's own
@@ -113,7 +111,6 @@ export default function App() {
     setLibraryLayout(loadJSON(`lang:layout:library:${id}`, DEFAULT_LIBRARY_LAYOUT))
     setSelectedSource(null)
     setSelectedCard(null)
-    setSelectedTable(null)
     setSelectedTag(null)
     setPeek(null)
     setPracticeSession(null)
@@ -134,9 +131,12 @@ export default function App() {
   }
 
   // The only cross-mode hand-off in the app (plan.md B5): Library's card multi-select + "Practice"
-  // footer, and Practice's own quick-start, both funnel through here.
-  function handleStartPractice(cards, practiceMode) {
-    setPracticeSession({ cards, mode: practiceMode })
+  // footer, and Practice's own quick-start, both funnel through here. `skills` is a list of
+  // { card, type } pairs — practice is generated per-skill now, not per-card (see
+  // lib/practiceRules.js and CLAUDE.md's "Skills" section); each skill's question type is decided
+  // server-side by the rule registry, not chosen here.
+  function handleStartPractice(skills) {
+    setPracticeSession({ skills })
     setMode('practice')
   }
 
@@ -151,8 +151,7 @@ export default function App() {
     if (text) setChatInput(prev => prev ? prev + '\n' + text : text)
   }
 
-  function openPeekCard(card) { setPeek({ type: 'card', card }) }
-  function openPeekTable(table) { setPeek({ type: 'table', table }) }
+  function openPeekCard(card, highlightSkillType) { setPeek({ type: 'card', card, highlightSkillType }) }
   function openPeekTag(tagName) { setPeek({ type: 'tag', tagName }) }
   function closePeek() { setPeek(null) }
 
@@ -169,6 +168,20 @@ export default function App() {
       return { ...prev, openPanels }
     })
     setSelectedCard(card)
+    setPeek(null)
+  }
+
+  // Clicking a source inside the card peek overlay (Practice mode's card browser has no source
+  // panel of its own) — same hand-off shape as "Open in Library" above, but for a source.
+  function handleOpenSourceInLibrary(source) {
+    setMode('library')
+    setLibraryLayout(prev => {
+      let openPanels = prev.openPanels
+      if (!openPanels.includes('sources')) openPanels = [...openPanels, 'sources']
+      if (!openPanels.includes('source-detail')) openPanels = [...openPanels, 'source-detail']
+      return { ...prev, openPanels }
+    })
+    setSelectedSource(source)
     setPeek(null)
   }
 
@@ -196,7 +209,6 @@ export default function App() {
             onLayoutChange={setLibraryLayout}
             selectedSource={selectedSource} setSelectedSource={setSelectedSource}
             selectedCard={selectedCard} setSelectedCard={setSelectedCard}
-            selectedTable={selectedTable} setSelectedTable={setSelectedTable}
             selectedTag={selectedTag} setSelectedTag={setSelectedTag}
             onAppendToChat={revealChat}
             onStartPractice={handleStartPractice}
@@ -210,9 +222,7 @@ export default function App() {
             onStartPractice={handleStartPractice}
             onEndSession={handleEndPracticeSession}
             onSelectCard={openPeekCard}
-            onSelectTable={openPeekTable}
             peekCardId={peek?.type === 'card' ? peek.card.id : null}
-            peekTableId={peek?.type === 'table' ? peek.table.id : null}
             generatedContext={generatedContext}
             tagCatalog={tagCatalog}
             onNewTags={refreshTagCatalog}
@@ -269,15 +279,8 @@ export default function App() {
               onClose={closePeek}
               onAppendToChat={revealChat}
               onSelectTag={openPeekTag}
-            />
-          )}
-          {peek?.type === 'table' && (
-            <TableDetailPanel
-              table={peek.table}
-              activeProject={activeProject}
-              onClose={closePeek}
-              onAppendToChat={revealChat}
-              onSelectTag={openPeekTag}
+              onSelectSource={handleOpenSourceInLibrary}
+              highlightSkillType={peek.highlightSkillType}
             />
           )}
           {peek?.type === 'tag' && (

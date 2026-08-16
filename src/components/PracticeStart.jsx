@@ -1,18 +1,19 @@
 import { useState } from 'react'
 import { apiFetch } from '../apiFetch.js'
 
-// Practice-entry path 2 (plan.md B5): quick-start with no card picking. Practices the most
-// recently added cards. Deliberately no scheduling/spacing logic — see plan.md non-goals.
+// Practice-entry path 2 (plan.md B5): quick-start with no picking. Samples skill rows
+// project-wide (skills are the practice unit now, not cards — see lib/practiceRules.js and
+// CLAUDE.md's "Skills" section), excluding anything answered correctly in the past
+// EXCLUDE_RECENT_DAYS (see api/skills.js), weighted by importance rather than sorted by
+// recency — see api/skills.js's `sort=weighted` mode for the actual sampling.
 const QUICK_START_COUNT = 10
 
 // "Random" is the same quick-start idea (plan.md B5: "most recently added N, or a random
-// selection") but sampling uniformly across every card in the project instead of just the
+// selection") but sampling uniformly across every skill in the project instead of just the
 // newest ones. No backend random endpoint exists (or is warranted at this app's
-// personal-project scale) — /api/knowledge-cards already reports `total` under offset/limit
-// pagination, so true uniform sampling is just N random offsets fetched with limit=1 each,
-// no DB changes required. `selectionMethod` is fixed to 'random' for now; kept as an explicit
-// param so a future picker (by tag, by skill, etc.) has somewhere to plug in without
-// reshaping this function.
+// personal-project scale) — /api/skills already reports `total` under offset/limit pagination,
+// so true uniform sampling is just N random offsets fetched with limit=1 each, no DB changes
+// required.
 const RANDOM_COUNT = 10
 
 function randomOffsets(total, n) {
@@ -22,6 +23,10 @@ function randomOffsets(total, n) {
     offsets.add(Math.floor(Math.random() * total))
   }
   return [...offsets]
+}
+
+function toSkill(row) {
+  return { card: row.card, type: row.type }
 }
 
 export function PracticeStart({ activeProject, onStart, onBrowse }) {
@@ -36,18 +41,18 @@ export function PracticeStart({ activeProject, onStart, onBrowse }) {
     try {
       const params = new URLSearchParams({
         project_id: activeProject.id,
-        sort: 'recent',
+        sort: 'weighted',
         limit: String(QUICK_START_COUNT),
       })
-      const res = await apiFetch(`/api/knowledge-cards?${params}`)
+      const res = await apiFetch(`/api/skills?${params}`)
       const data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(data.error ?? 'Failed to load cards')
-      const cards = data.cards ?? []
-      if (cards.length === 0) {
-        setError('No cards yet — save some from Learn first.')
+      if (!res.ok) throw new Error(data.error ?? 'Failed to load skills')
+      const skills = (data.skills ?? []).map(toSkill)
+      if (skills.length === 0) {
+        setError('No skills yet — save some cards from Learn first.')
         return
       }
-      onStart(cards, 'mc_cloze')
+      onStart(skills)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -55,44 +60,42 @@ export function PracticeStart({ activeProject, onStart, onBrowse }) {
     }
   }
 
-  async function handleRandomStart(selectionMethod = 'random') {
+  async function handleRandomStart() {
     if (!activeProject) return
     setRandomLoading(true)
     setError(null)
     try {
-      const countRes = await apiFetch(`/api/knowledge-cards?${new URLSearchParams({
+      const countRes = await apiFetch(`/api/skills?${new URLSearchParams({
         project_id: activeProject.id,
         limit: '1',
       })}`)
       const countData = await countRes.json().catch(() => ({}))
-      if (!countRes.ok) throw new Error(countData.error ?? 'Failed to load cards')
+      if (!countRes.ok) throw new Error(countData.error ?? 'Failed to load skills')
       const total = countData.total ?? 0
       if (total === 0) {
-        setError('No cards yet — save some from Learn first.')
+        setError('No skills yet — save some cards from Learn first.')
         return
       }
 
-      const offsets = selectionMethod === 'random'
-        ? randomOffsets(total, RANDOM_COUNT)
-        : Array.from({ length: Math.min(total, RANDOM_COUNT) }, (_, i) => i)
+      const offsets = randomOffsets(total, RANDOM_COUNT)
 
       const picks = await Promise.all(offsets.map(async (offset) => {
-        const res = await apiFetch(`/api/knowledge-cards?${new URLSearchParams({
+        const res = await apiFetch(`/api/skills?${new URLSearchParams({
           project_id: activeProject.id,
           limit: '1',
           offset: String(offset),
         })}`)
         const data = await res.json().catch(() => ({}))
-        if (!res.ok) throw new Error(data.error ?? 'Failed to load cards')
-        return data.cards?.[0]
+        if (!res.ok) throw new Error(data.error ?? 'Failed to load skills')
+        return data.skills?.[0]
       }))
 
-      const cards = picks.filter(Boolean)
-      if (cards.length === 0) {
-        setError('No cards yet — save some from Learn first.')
+      const skills = picks.filter(Boolean).map(toSkill)
+      if (skills.length === 0) {
+        setError('No skills yet — save some cards from Learn first.')
         return
       }
-      onStart(cards, 'mc_cloze')
+      onStart(skills)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -117,7 +120,7 @@ export function PracticeStart({ activeProject, onStart, onBrowse }) {
           {loading ? 'Loading…' : 'Quick practice'}
         </button>
         <button
-          onClick={() => handleRandomStart()}
+          onClick={handleRandomStart}
           disabled={randomLoading || !activeProject}
           className="text-sm font-medium bg-purple-600 text-white rounded-lg px-4 py-1.5 hover:bg-purple-700 disabled:opacity-40 transition-colors"
         >

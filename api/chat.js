@@ -60,42 +60,16 @@ export default async function handler(req, res) {
   async function executeSearchKnowledgeCards(query) {
     const { data, error } = await supabase
       .from('knowledge_cards')
-      .select('id, name, kind, tags, skill, importance')
+      .select('id, name, kind, tags, importance')
       .ilike('name', `%${query}%`)
       .eq('project_id', project_id)
       .limit(5)
-    return error ? [] : data
-  }
-
-  async function executeSearchTables(query) {
-    const { data, error } = await supabase
-      .from('tables')
-      .select('id, name, axes, axis_values, tags')
-      .ilike('name', `%${query}%`)
-      .eq('project_id', project_id)
-      .limit(5)
-    return error ? [] : data
-  }
-
-  async function executeSearchTableCells(tableId, axisValues) {
-    const cellKey = Object.keys(axisValues)
-      .sort()
-      .map(k => String(axisValues[k]).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''))
-      .join('-')
-    const { data, error } = await supabase
-      .from('table_cells')
-      .select('id, cell_key, axis_values, skill')
-      .eq('table_id', tableId)
-      .eq('cell_key', cellKey)
-      .limit(1)
     return error ? [] : data
   }
 
   async function executeTool(name, input) {
     if (name === 'search_sources') return executeSearchSources(input.original_text)
     if (name === 'search_knowledge_cards') return executeSearchKnowledgeCards(input.query)
-    if (name === 'search_tables') return executeSearchTables(input.query)
-    if (name === 'search_table_cells') return executeSearchTableCells(input.table_id, input.axis_values)
     return []
   }
 
