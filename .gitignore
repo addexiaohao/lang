@@ -3,3 +3,7 @@ dist/
 .env*
 !.env.example
 .vercel
+plan.md
+CLAUDE.md
+summary.md
+TODO.md
