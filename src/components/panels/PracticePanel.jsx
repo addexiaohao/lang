@@ -69,6 +69,13 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
   // in the background — that's the whole latency strategy.
   const prefetchRef = useRef({})
   const sessionKeyRef = useRef(0)
+  // Groups every practice_attempt row produced for the item currently on screen — regenerated
+  // (crypto.randomUUID()) whenever `current` becomes a genuinely new item (loadCurrent, advance,
+  // handleNochEinSatz), but left UNCHANGED across an "Easier sentence" regeneration, since that's a
+  // continuation of the same encounter, not a new one (see handleEasierSentence). A ref, not state:
+  // nothing renders off it, it just needs to be current by the time handleAnswered/
+  // handleEasierSentence read it.
+  const encounterIdRef = useRef(null)
   // card.id -> Promise<detail|null> — the card panel's own fetch, kept separate from the
   // question-item prefetch above. Started as soon as an item loads (see effect below), well
   // before the user answers, so by the time the panel auto-opens the data is already there.
@@ -109,10 +116,16 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
   // fresh card-detail fetch so the auto-shown panel picks up the new level instead of the
   // pre-answer one it was prefetched with, and diff against `beforeLevel` (the level as of the
   // moment the answer was given — see handleAnswered) to drive the +N/-N badge.
-  const recordPracticeResult = useCallback((targetSkill, correct, beforeLevel) => {
+  const recordPracticeResult = useCallback((targetSkill, correct, beforeLevel, encounterId, model, requestSnapshot, rawItem) => {
     apiFetch(`/api/knowledge-cards?${new URLSearchParams({ project_id: activeProject.id, id: targetSkill.card.id })}`, {
       method: 'PATCH',
-      body: JSON.stringify({ skill_type: targetSkill.type, practice_result: correct ? 'correct' : 'incorrect' }),
+      body: JSON.stringify({
+        skill_type: targetSkill.type,
+        practice_result: correct ? 'correct' : 'incorrect',
+        encounter_id: encounterId,
+        model,
+        conversation: { request: requestSnapshot, response: rawItem },
+      }),
     })
       .then(() => fetchCardDetail(targetSkill.card, { force: true }))
       .then(detail => {
@@ -122,6 +135,27 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
       })
       .catch(e => console.error('[practice] failed to record result', e))
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.id])
+
+  // Fired from handleEasierSentence for the round being abandoned — logs outcome 'too_hard'
+  // without touching skill.level/last_correct (unlike recordPracticeResult), via the dedicated
+  // api/practice-attempt.js endpoint. Shares the same encounterId as whatever round comes next in
+  // this chain (handleEasierSentence doesn't touch encounterIdRef), so all rounds of one "Easier
+  // sentence" chain land under one encounter_id. Fire-and-forget, same as recordPracticeResult.
+  const logTooHard = useCallback((targetSkill, encounterId, model, requestSnapshot, rawItem) => {
+    if (!encounterId) return
+    apiFetch('/api/practice-attempt', {
+      method: 'POST',
+      body: JSON.stringify({
+        project_id: activeProject.id,
+        card_id: targetSkill.card.id,
+        skill_type: targetSkill.type,
+        encounter_id: encounterId,
+        outcome: 'too_hard',
+        model,
+        conversation: { request: requestSnapshot, response: rawItem },
+      }),
+    }).catch(e => console.error('[practice] failed to log too_hard attempt', e))
   }, [activeProject?.id])
 
   // `history`/`problemType`, if given, continue an existing "Easier sentence" conversation for
@@ -164,6 +198,8 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
       mode: body.mode,
       problemType: body.problem_type,
       rawItem: body.item,
+      request: body.request ?? null,
+      model: body.request?.model ?? null,
       skill: { card: body.card ?? targetSkill.card, type: body.skill_type ?? targetSkill.type },
       seed: { offered: body.seed_card_names ?? [], used: body.item?.used_seed_words ?? [] },
     }
@@ -176,6 +212,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     try {
       const item = await requestItem(skills[targetIndex])
       if (sessionKeyRef.current !== mySession) return
+      encounterIdRef.current = crypto.randomUUID()
       setCurrent(item)
       setEasierCount(0)
       setItemHistory([item.rawItem])
@@ -240,7 +277,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     setCardOpen(true)
     setLevelChange(null)
     const beforeLevel = cardDetails[effectiveSkill.card.id]?.skill?.find(s => s.type === effectiveSkill.type)?.level ?? null
-    recordPracticeResult(effectiveSkill, correct, beforeLevel)
+    recordPracticeResult(effectiveSkill, correct, beforeLevel, encounterIdRef.current, current?.model, current?.request, current?.rawItem)
     setResults(prev => ({ ...prev, [index]: { skill: effectiveSkill, correct } }))
   }
 
@@ -259,6 +296,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     setIndex(nextIndex)
     setSentenceCount(1)
     if (prefetched) {
+      encounterIdRef.current = crypto.randomUUID()
       setCurrent(prefetched)
       setEasierCount(0)
       setItemHistory([prefetched.rawItem])
@@ -279,6 +317,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     prefetchRef.current.same = null
     setSentenceCount(c => c + 1)
     if (prefetched) {
+      encounterIdRef.current = crypto.randomUUID()
       setCurrent(prefetched)
       setEasierCount(0)
       setItemHistory([prefetched.rawItem])
@@ -317,6 +356,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
   // `easierCount` reaches that cap (the server clamps `history` length too, independently).
   async function handleEasierSentence() {
     if (!current || easierCount >= MAX_EASIER_SENTENCE_ATTEMPTS) return
+    logTooHard(effectiveSkill, encounterIdRef.current, current.model, current.request, current.rawItem)
     setExplain(null)
     setAddSource(null)
     setLoading(true)

@@ -16,7 +16,7 @@ const TABLE_SCHEMA = {
     required: ['kind', 'name'],
     optional: ['details', 'tags', 'importance'],
     enums: { kind: ['vocabulary', 'grammar', 'expression'] },
-    ranges: { importance: [1, 10] },
+    ranges: { importance: [0, 10] },
   },
   source_knowledge: {
     required: ['source_id', 'knowledge_card_id'],

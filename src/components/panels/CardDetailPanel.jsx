@@ -61,31 +61,55 @@ function skillColor(level) {
 }
 
 // One dot-row per value (level or importance) — shared shape for flat types and paradigm cells.
-// `value == null` (not yet assessed, or never encountered) renders all dots empty.
+// `value == null` (not yet assessed, or never encountered) renders all dots empty (light gray).
+// `value === 0` is a distinct, deliberate "marked unimportant" state (importance only — level
+// has no zero) — dots render darker than the empty-gray used for "not set", so the two states
+// never look the same at a glance. `zeroable` (importance rows) additionally renders the label
+// as a button that toggles the whole row to/from 0.
 const DOT_COLORS = {
   blue: { filled: 'bg-blue-500', empty: 'hover:bg-blue-200' },
   amber: { filled: 'bg-amber-500', empty: 'hover:bg-amber-200' },
 }
-function Dots({ value, onSet, disabled, color, emptyLabel }) {
+function Dots({ value, onSet, disabled, color, emptyLabel, label, zeroable }) {
   const c = DOT_COLORS[color]
+  const isZero = value === 0
   return (
-    <div className="flex items-center gap-1.5">
-      <div className="flex gap-0.5">
-        {Array.from({ length: 10 }, (_, i) => {
-          const dotValue = i + 1
-          const filled = value != null && dotValue <= value
-          return (
-            <button
-              key={dotValue}
-              onClick={() => onSet(dotValue)}
-              disabled={disabled}
-              title={`Set to ${dotValue}`}
-              className={`w-2 h-2 rounded-sm transition-colors disabled:cursor-wait ${filled ? c.filled : `bg-gray-200 ${c.empty}`}`}
-            />
-          )
-        })}
+    <div className="flex items-center gap-2">
+      {label && (
+        zeroable ? (
+          <button
+            type="button"
+            onClick={() => onSet(isZero ? null : 0)}
+            disabled={disabled}
+            title={isZero ? 'Unset — click to clear' : 'Mark unimportant'}
+            className={`text-[9px] w-14 shrink-0 text-left transition-colors disabled:cursor-wait ${isZero ? 'line-through text-gray-500' : 'text-gray-400 hover:text-amber-600'}`}
+          >
+            {label}
+          </button>
+        ) : (
+          <span className="text-[9px] text-gray-400 w-14 shrink-0">{label}</span>
+        )
+      )}
+      <div className="flex items-center gap-1.5">
+        <div className="flex gap-0.5">
+          {Array.from({ length: 10 }, (_, i) => {
+            const dotValue = i + 1
+            const filled = value != null && value > 0 && dotValue <= value
+            return (
+              <button
+                key={dotValue}
+                onClick={() => onSet(dotValue)}
+                disabled={disabled}
+                title={`Set to ${dotValue}`}
+                className={`w-2 h-2 rounded-sm transition-colors disabled:cursor-wait ${filled ? c.filled : isZero ? 'bg-gray-400 hover:bg-gray-500' : `bg-gray-200 ${c.empty}`}`}
+              />
+            )
+          })}
+        </div>
+        <span className="text-[10px] text-gray-500 w-24 shrink-0">
+          {isZero ? 'unimportant' : value != null ? `${value}/10` : emptyLabel}
+        </span>
       </div>
-      <span className="text-[10px] text-gray-500 w-24 shrink-0">{value != null ? `${value}/10` : emptyLabel}</span>
     </div>
   )
 }
@@ -126,13 +150,11 @@ function FlatSkillList({ kind, skillRows, onSetLevel, onSetImportance, savingTyp
           >
             <p className="text-[10px] text-gray-500 mb-1 truncate" title={type}>{type}</p>
             <div className="flex items-center gap-2">
-              <span className="text-[9px] text-gray-400 w-14 shrink-0">Level</span>
-              <Dots value={row?.level ?? null} disabled={disabled} color="blue" emptyLabel="not yet assessed" onSet={value => onSetLevel(type, value)} />
+              <Dots value={row?.level ?? null} disabled={disabled} color="blue" label="Level" emptyLabel="not yet assessed" onSet={value => onSetLevel(type, value)} />
               {type === levelChange?.type && <LevelDelta delta={levelChange.delta} />}
             </div>
             <div className="flex items-center gap-2 mt-1">
-              <span className="text-[9px] text-gray-400 w-14 shrink-0">Importance</span>
-              <Dots value={row?.importance ?? null} disabled={disabled} color="amber" emptyLabel="not set" onSet={value => onSetImportance(type, value)} />
+              <Dots value={row?.importance ?? null} disabled={disabled} color="amber" label="Importance" zeroable emptyLabel="not set" onSet={value => onSetImportance(type, value)} />
             </div>
           </div>
         )
@@ -226,22 +248,23 @@ function ParadigmSkillGrid({ axes, skillRows, onSetLevel, onSetImportance, savin
             Cell — {selectedType}{!selected && ' (never encountered)'}
           </p>
           <div className="flex items-center gap-2">
-            <span className="text-[9px] text-gray-400 w-14 shrink-0">Level</span>
             <Dots
               value={selected?.level ?? null}
               disabled={savingType === selectedType}
               color="blue"
+              label="Level"
               emptyLabel="not yet assessed"
               onSet={value => onSetLevel(selectedType, value)}
             />
             {selectedType === levelChange?.type && <LevelDelta delta={levelChange.delta} />}
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-[9px] text-gray-400 w-14 shrink-0">Importance</span>
             <Dots
               value={selected?.importance ?? null}
               disabled={savingType === selectedType}
               color="amber"
+              label="Importance"
+              zeroable
               emptyLabel="not set"
               onSet={value => onSetImportance(selectedType, value)}
             />
@@ -260,12 +283,24 @@ function ParadigmSkillGrid({ axes, skillRows, onSetLevel, onSetImportance, savin
 // "other vocabulary already known" pool offered to the model for the current item vs. what it
 // reports actually weaving in (lib/prompts/registry.js's seedSection, api/practice.js) — rendered
 // as a "Suggested vocabulary" section alongside the skill tested.
-export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, onDragStart, onSelectTag, onSelectSource, highlightSkillType, prefetchedDetail, levelChange, seedInfo }) {
+export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRenamed, onAppendToChat, onDragStart, onSelectTag, onSelectSource, highlightSkillType, prefetchedDetail, levelChange, seedInfo }) {
   const [detail, setDetail] = useState(prefetchedDetail?.id === card?.id ? prefetchedDetail : null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [savingImportance, setSavingImportance] = useState(false)
   const [savingSkillType, setSavingSkillType] = useState(null)
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+  const [editingName, setEditingName] = useState(false)
+  const [nameDraft, setNameDraft] = useState('')
+  const [savingName, setSavingName] = useState(false)
+  const [nameError, setNameError] = useState(null)
+
+  useEffect(() => {
+    setConfirmingDelete(false)
+    setEditingName(false)
+    setNameError(null)
+  }, [card?.id])
 
   useEffect(() => {
     if (!card || !activeProject) return
@@ -338,6 +373,55 @@ export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, 
     ?.map(sk => sk.sources ? { ...sk.sources, positions: sk.positions ?? [] } : null)
     .filter(Boolean) ?? []
 
+  function startEditingName() {
+    setNameDraft(card.name)
+    setNameError(null)
+    setEditingName(true)
+  }
+
+  async function saveName() {
+    const trimmed = nameDraft.trim()
+    if (!card || !activeProject || !trimmed || trimmed === card.name) {
+      setEditingName(false)
+      return
+    }
+    setSavingName(true)
+    setNameError(null)
+    try {
+      const r = await apiFetch(`/api/knowledge-cards?project_id=${activeProject.id}&id=${card.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: trimmed }),
+      })
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}))
+        throw new Error(body.error || r.statusText)
+      }
+      const updated = await r.json()
+      setDetail(prev => prev ? { ...prev, name: updated.name } : prev)
+      onRenamed?.(card.id, updated.name)
+      setEditingName(false)
+    } catch (e) {
+      setNameError(String(e.message || e))
+    } finally {
+      setSavingName(false)
+    }
+  }
+
+  async function deleteCard() {
+    if (!card || !activeProject) return
+    setDeleting(true)
+    setError(null)
+    try {
+      const r = await apiFetch(`/api/knowledge-cards?project_id=${activeProject.id}&id=${card.id}`, { method: 'DELETE' })
+      if (!r.ok) throw new Error(r.statusText)
+      onDeleted ? onDeleted(card.id) : onClose?.()
+    } catch (e) {
+      setError(String(e))
+      setDeleting(false)
+    }
+  }
+
   return (
     <div className="flex flex-col h-full min-w-0">
       <div
@@ -366,7 +450,32 @@ export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, 
           {/* Card identity */}
           <div>
             <div className="flex items-start gap-2">
-              <h2 className="text-sm font-semibold text-gray-900 flex-1 leading-snug">{card.name}</h2>
+              {editingName ? (
+                <div className="flex-1 min-w-0">
+                  <input
+                    autoFocus
+                    type="text"
+                    value={nameDraft}
+                    disabled={savingName}
+                    onChange={e => setNameDraft(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') saveName()
+                      if (e.key === 'Escape') setEditingName(false)
+                    }}
+                    onBlur={saveName}
+                    className="w-full text-sm font-semibold text-gray-900 border border-blue-300 rounded px-1.5 py-0.5 focus:outline-none focus:ring-1 focus:ring-blue-400 disabled:opacity-60"
+                  />
+                  {nameError && <p className="text-[10px] text-red-500 mt-0.5">{nameError}</p>}
+                </div>
+              ) : (
+                <button
+                  onClick={startEditingName}
+                  title="Click to rename"
+                  className="text-sm font-semibold text-gray-900 flex-1 leading-snug text-left hover:bg-gray-50 rounded px-0.5 -mx-0.5 transition-colors"
+                >
+                  {card.name}
+                </button>
+              )}
               <span className={`text-[10px] rounded px-1.5 py-0.5 font-medium shrink-0 ${KIND_COLORS[card.kind] ?? 'bg-gray-100 text-gray-600'}`}>
                 {card.kind}
               </span>
@@ -387,25 +496,7 @@ export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, 
             )}
 
             <div className="flex items-center gap-4 mt-3">
-              <div className="flex items-center gap-1.5">
-                <span className="text-[10px] text-gray-400">Importance</span>
-                <div className="flex gap-0.5">
-                  {Array.from({ length: 10 }, (_, i) => {
-                    const value = i + 1
-                    const filled = importance != null && value <= importance
-                    return (
-                      <button
-                        key={value}
-                        onClick={() => updateImportance(value)}
-                        disabled={savingImportance}
-                        title={`Set importance to ${value}`}
-                        className={`w-2 h-2 rounded-sm transition-colors disabled:cursor-wait ${filled ? 'bg-amber-500' : 'bg-gray-200 hover:bg-amber-200'}`}
-                      />
-                    )
-                  })}
-                </div>
-                <span className="text-[10px] text-gray-500">{importance != null ? `${importance}/10` : '—'}</span>
-              </div>
+              <Dots value={importance} disabled={savingImportance} color="amber" label="Importance" zeroable emptyLabel="—" onSet={updateImportance} />
             </div>
           </div>
 
@@ -502,6 +593,38 @@ export function CardDetailPanel({ card, activeProject, onClose, onAppendToChat, 
                 </div>
               ))}
             </div>
+          </div>
+
+          {/* Delete card — cascades to its skills, practice history, and source links */}
+          <div className="border-t pt-4">
+            {confirmingDelete ? (
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-red-600 flex-1">
+                  Delete "{card.name}" and all its skills, practice history, and source links? This cannot be undone.
+                </span>
+                <button
+                  onClick={deleteCard}
+                  disabled={deleting}
+                  className="text-xs font-medium text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded px-2 py-1 shrink-0 transition-colors"
+                >
+                  {deleting ? 'Deleting…' : 'Confirm delete'}
+                </button>
+                <button
+                  onClick={() => setConfirmingDelete(false)}
+                  disabled={deleting}
+                  className="text-xs text-gray-500 hover:text-gray-700 disabled:opacity-60 rounded px-2 py-1 shrink-0 transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmingDelete(true)}
+                className="text-xs font-medium text-red-600 hover:text-red-700 transition-colors"
+              >
+                Delete card
+              </button>
+            )}
           </div>
         </div>
       )}

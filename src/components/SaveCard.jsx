@@ -47,6 +47,17 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
     : null
   const rangeFields = new Set(['importance'])
   const unknownFieldSet = new Set(unknownFields)
+  // Remembers the importance value the "Importance" label toggle overwrote with 0, so toggling
+  // back restores it instead of leaving the field blank (blank would fail the smallint cast on save).
+  const [importanceBeforeZero, setImportanceBeforeZero] = useState(null)
+  function toggleZeroImportance(currentValue) {
+    if (currentValue === '0' || currentValue === 0) {
+      update('importance', importanceBeforeZero || '1')
+    } else {
+      setImportanceBeforeZero(currentValue)
+      update('importance', '0')
+    }
+  }
   const catalogSet = new Set(tagCatalog.map(t => t.name))
   const catalogMap = new Map(tagCatalog.map(t => [t.name, t]))
 
@@ -324,9 +335,21 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
           )
         }
 
+        const isZeroImportance = key === 'importance' && (value === '0' || value === 0)
         return (
           <div key={key}>
-            <label className={`block text-xs mb-0.5 ${unknownFieldSet.has(key) ? 'text-amber-500' : 'text-gray-500'}`}>{key}</label>
+            {rangeFields.has(key) ? (
+              <button
+                type="button"
+                onClick={() => toggleZeroImportance(value)}
+                title={isZeroImportance ? 'Click to restore' : 'Mark unimportant'}
+                className={`block text-xs mb-0.5 transition-colors ${isZeroImportance ? 'line-through text-gray-500' : unknownFieldSet.has(key) ? 'text-amber-500' : 'text-gray-500 hover:text-amber-600'}`}
+              >
+                {key}
+              </button>
+            ) : (
+              <label className={`block text-xs mb-0.5 ${unknownFieldSet.has(key) ? 'text-amber-500' : 'text-gray-500'}`}>{key}</label>
+            )}
             {key === 'context_id' ? (
               forcedContext ? (
                 <div
@@ -351,13 +374,13 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
               <div className="flex items-center gap-2">
                 <input
                   type="range"
-                  min={1}
+                  min={0}
                   max={10}
-                  value={value || 1}
+                  value={value === '' ? 1 : value}
                   onChange={e => update(key, e.target.value)}
-                  className="flex-1 accent-blue-500"
+                  className={`flex-1 ${isZeroImportance ? 'accent-gray-500' : 'accent-blue-500'}`}
                 />
-                <span className="text-xs font-mono w-4 text-center">{value || 1}</span>
+                <span className={`text-xs font-mono w-4 text-center ${isZeroImportance ? 'text-gray-500' : ''}`}>{value === '' ? 1 : value}</span>
               </div>
             ) : key === 'details' && proposedAxes ? (
               <div className="rounded-md bg-white border border-gray-200 px-2 py-1.5 space-y-1.5">

@@ -43,6 +43,7 @@ export function PracticeMode({
           ) : browsing ? (
             <CardsPanel
               activeProject={activeProject}
+              tagCatalog={tagCatalog}
               onSelectCard={onSelectCard}
               selectedCardId={peekCardId}
               onClose={() => setBrowsing(false)}

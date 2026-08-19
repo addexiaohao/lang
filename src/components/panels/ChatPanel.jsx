@@ -1,8 +1,8 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, forwardRef, useImperativeHandle } from 'react'
 import ChatMessage from '../ChatMessage.jsx'
 import { apiFetch } from '../../apiFetch.js'
 
-export function ChatPanel({ activeProject, contexts, forcedContext, tagCatalog, onNewTags, input, onInputChange, onDragStart, onClose, title = 'Chat', initialMessage }) {
+export const ChatPanel = forwardRef(function ChatPanel({ activeProject, contexts, forcedContext, tagCatalog, onNewTags, input, onInputChange, onDragStart, onClose, title = 'Chat', initialMessage }, ref) {
   const [messages, setMessages] = useState([])
   const [isStreaming, setIsStreaming] = useState(false)
   const [sourceRefMap, setSourceRefMap] = useState({})
@@ -45,6 +45,10 @@ export function ChatPanel({ activeProject, contexts, forcedContext, tagCatalog, 
   const handleSourceSaved = useCallback((ref, id) => {
     if (ref != null) setSourceRefMap(prev => ({ ...prev, [ref]: { ...(prev[ref] ?? {}), id } }))
   }, [])
+
+  useImperativeHandle(ref, () => ({
+    clearMessages: () => { setMessages([]); setSourceRefMap({}) },
+  }), [])
 
   async function sendText(text) {
     if (!text || isStreaming || !activeProject) return
@@ -186,4 +190,4 @@ export function ChatPanel({ activeProject, contexts, forcedContext, tagCatalog, 
       </form>
     </div>
   )
-}
+})

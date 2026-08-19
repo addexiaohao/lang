@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useProject } from './ProjectContext.jsx'
 import { apiFetch } from './apiFetch.js'
@@ -61,6 +61,7 @@ export default function App() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [chatInput, setChatInput] = useState('')
   const [showSettings, setShowSettings] = useState(false)
+  const chatPanelRef = useRef(null)
 
   useEffect(() => {
     if (!activeProject) return
@@ -148,12 +149,18 @@ export default function App() {
   // Explain/Why? buttons, the chat FAB, and every panel's "add to chat" action.
   function revealChat(text) {
     if (mode !== 'learn') setDrawerOpen(true)
-    if (text) setChatInput(prev => prev ? prev + '\n' + text : text)
+    if (text) {
+      chatPanelRef.current?.clearMessages()
+      setChatInput(text)
+    }
   }
 
   function openPeekCard(card, highlightSkillType) { setPeek({ type: 'card', card, highlightSkillType }) }
   function openPeekTag(tagName) { setPeek({ type: 'tag', tagName }) }
   function closePeek() { setPeek(null) }
+  function handlePeekCardRenamed(cardId, newName) {
+    setPeek(prev => (prev?.type === 'card' && prev.card.id === cardId) ? { ...prev, card: { ...prev.card, name: newName } } : prev)
+  }
 
   // Card peek overlay's "Open in Library" (plan.md B4): switches mode, makes sure Library has the
   // right panels open, and hands the card to Library's own selection state.
@@ -235,6 +242,7 @@ export default function App() {
           onBackdropClick={() => setDrawerOpen(false)}
         >
           <ChatPanel
+            ref={chatPanelRef}
             activeProject={activeProject}
             contexts={pickableContexts}
             tagCatalog={tagCatalog}
@@ -277,6 +285,8 @@ export default function App() {
               card={peek.card}
               activeProject={activeProject}
               onClose={closePeek}
+              onDeleted={closePeek}
+              onRenamed={handlePeekCardRenamed}
               onAppendToChat={revealChat}
               onSelectTag={openPeekTag}
               onSelectSource={handleOpenSourceInLibrary}

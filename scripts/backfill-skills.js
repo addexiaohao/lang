@@ -1,5 +1,5 @@
 // Standalone, repeatable backfill: walks existing knowledge_cards and (1) creates any missing flat
-// skill rows (level = 1, baseline) per lib/skillTypes.js's deriveFlatSkillTypes(), and (2) fills in
+// skill rows (level = null, never practiced) per lib/skillTypes.js's deriveFlatSkillTypes(), and (2) fills in
 // `importance` on existing flat skill rows that don't have one yet — both via
 // deriveSkillImportance(kind, type, card.importance). Rows that already carry a manually-set
 // importance are left untouched. Paradigm cards (details.axes present) are skipped — their cells
@@ -86,7 +86,7 @@ async function main() {
           toInsert.push({
             card_id: card.id,
             type,
-            level: 1,
+            level: null,
             importance: deriveSkillImportance(card.kind, type, card.importance),
           })
         }

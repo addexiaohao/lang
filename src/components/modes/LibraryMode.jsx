@@ -6,6 +6,7 @@ import { CardsPanel } from '../panels/CardsPanel.jsx'
 import { CardDetailPanel } from '../panels/CardDetailPanel.jsx'
 import { TagsPanel } from '../panels/TagsPanel.jsx'
 import { ContextsPanel } from '../panels/ContextsPanel.jsx'
+import { SkillsPanel } from '../panels/SkillsPanel.jsx'
 
 // The existing multi-panel workspace (plan.md: "unchanged"), extracted verbatim out of App.jsx.
 // `layout` ({ openPanels, panelWidths }) and the four selection values are controlled from
@@ -18,6 +19,7 @@ export const LIBRARY_DEFAULT_WIDTHS = {
   'card-detail': 360,
   tags: 340,
   contexts: 340,
+  skills: 420,
 }
 const MIN_WIDTH = 100
 
@@ -32,6 +34,15 @@ const LIBRARY_TABS = [
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
         <rect x="2" y="5" width="20" height="14" rx="2" />
         <path d="M2 10h20" />
+      </svg>
+    ),
+  },
+  {
+    id: 'skills',
+    label: 'Skills',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
+        <path d="M12 20V10M18 20V4M6 20v-4" />
       </svg>
     ),
   },
@@ -79,6 +90,7 @@ export function LibraryMode({
   const [dragOverIndex, setDragOverIndex] = useState(null)
   const dragRef = useRef({ from: null, to: null })
   const panelContainerRef = useRef(null)
+  const [cardsRefreshSignal, setCardsRefreshSignal] = useState(0)
 
   function setOpenPanels(updater) {
     onLayoutChange(prev => ({
@@ -130,6 +142,16 @@ export function LibraryMode({
   function handleCloseCardDetail() {
     setSelectedCard(null)
     setOpenPanels(prev => prev.filter(p => p !== 'card-detail'))
+  }
+
+  function handleCardDeleted() {
+    handleCloseCardDetail()
+    setCardsRefreshSignal(s => s + 1)
+  }
+
+  function handleCardRenamed(cardId, newName) {
+    setSelectedCard(prev => (prev && prev.id === cardId) ? { ...prev, name: newName } : prev)
+    setCardsRefreshSignal(s => s + 1)
   }
 
   function handleSelectTag(tagName) {
@@ -244,17 +266,20 @@ export function LibraryMode({
             onClose={handleCloseSourceDetail}
             onAppendToChat={onAppendToChat}
             onDragStart={onDragStart}
+            onSelectCard={handleSelectCard}
           />
         )
       case 'cards':
         return (
           <CardsPanel
             activeProject={activeProject}
+            tagCatalog={tagCatalog}
             onSelectCard={handleSelectCard}
             selectedCardId={selectedCard?.id}
             onDragStart={onDragStart}
             onClose={onClose}
             onStartPractice={onStartPractice}
+            refreshSignal={cardsRefreshSignal}
           />
         )
       case 'card-detail':
@@ -263,10 +288,22 @@ export function LibraryMode({
             card={selectedCard}
             activeProject={activeProject}
             onClose={handleCloseCardDetail}
+            onDeleted={handleCardDeleted}
+            onRenamed={handleCardRenamed}
             onAppendToChat={onAppendToChat}
             onDragStart={onDragStart}
             onSelectTag={handleSelectTag}
             onSelectSource={handleSelectSource}
+          />
+        )
+      case 'skills':
+        return (
+          <SkillsPanel
+            activeProject={activeProject}
+            tagCatalog={tagCatalog}
+            onSelectCard={handleSelectCard}
+            onDragStart={onDragStart}
+            onClose={onClose}
           />
         )
       case 'tags':

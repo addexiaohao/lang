@@ -1,9 +1,10 @@
 import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
 import { validateSkillType } from '../lib/skillTypes.js'
+import { logPracticeAttempt } from '../lib/practiceAttempts.js'
 
 export default async function handler(req, res) {
-  if (req.method !== 'GET' && req.method !== 'PATCH') return res.status(405).json({ error: 'Method not allowed' })
+  if (req.method !== 'GET' && req.method !== 'PATCH' && req.method !== 'DELETE') return res.status(405).json({ error: 'Method not allowed' })
 
   let user
   try {
@@ -13,7 +14,10 @@ export default async function handler(req, res) {
     throw e
   }
 
-  const { project_id, id, q, tag, kind, sort, limit = '20', offset = '0' } = req.query
+  const {
+    project_id, id, q, tag, tags, kind, sort, sort_dir, limit = '20', offset = '0',
+    below_level, practice_state,
+  } = req.query
   if (!project_id) return res.status(400).json({ error: 'project_id required' })
 
   try {
@@ -23,10 +27,29 @@ export default async function handler(req, res) {
     throw e
   }
 
+  if (req.method === 'DELETE') {
+    if (!id) return res.status(400).json({ error: 'id required' })
+
+    // skill(card_id) and practice_attempt(skill_id) cascade off knowledge_cards/skill respectively,
+    // and source_knowledge(knowledge_card_id) now does too (see schema.sql) — deleting the card row
+    // is enough to take its skills, practice history, and source links with it.
+    const { data, error } = await supabase
+      .from('knowledge_cards')
+      .delete()
+      .eq('project_id', project_id)
+      .eq('id', id)
+      .select('id')
+      .maybeSingle()
+
+    if (error) return res.status(500).json({ error: error.message })
+    if (!data) return res.status(404).json({ error: 'Card not found' })
+    return res.status(204).end()
+  }
+
   if (req.method === 'PATCH') {
     if (!id) return res.status(400).json({ error: 'id required' })
 
-    const { importance, skill_type, level, practice_result } = req.body ?? {}
+    const { importance, name, skill_type, level, practice_result, model, encounter_id, conversation } = req.body ?? {}
 
     if (skill_type !== undefined) {
       const isPracticeResult = practice_result !== undefined
@@ -39,8 +62,8 @@ export default async function handler(req, res) {
       if (level !== undefined && level !== null && (!Number.isInteger(level) || level < 1 || level > 10)) {
         return res.status(400).json({ error: 'level must be an integer between 1 and 10, or null' })
       }
-      if (importance !== undefined && importance !== null && (!Number.isInteger(importance) || importance < 1 || importance > 10)) {
-        return res.status(400).json({ error: 'importance must be an integer between 1 and 10, or null' })
+      if (importance !== undefined && importance !== null && (!Number.isInteger(importance) || importance < 0 || importance > 10)) {
+        return res.status(400).json({ error: 'importance must be an integer between 0 and 10, or null' })
       }
       const { data: card, error: cardErr } = await supabase
         .from('knowledge_cards')
@@ -56,7 +79,7 @@ export default async function handler(req, res) {
       // Practice attempt (right/wrong/don't know from PracticePanel): bump level by one step
       // (floor 1, ceiling 10), instead of setting an explicit level like the manual editor does.
       // last_correct only stamps on a correct attempt — it's not "last attempted", it's "last
-      // gotten right".
+      // gotten right". hand_set is cleared — an earned level, not a self-assessment (plan.md §5).
       if (isPracticeResult) {
         const { data: existing } = await supabase
           .from('skill')
@@ -69,47 +92,69 @@ export default async function handler(req, res) {
           ? Math.min(currentLevel + 1, 10)
           : Math.max(currentLevel - 1, 1)
 
-        const row = { card_id: id, type: skill_type, level: nextLevel }
+        const row = { card_id: id, type: skill_type, level: nextLevel, hand_set: false }
         if (practice_result === 'correct') row.last_correct = new Date().toISOString()
 
         const { data, error } = await supabase
           .from('skill')
           .upsert(row, { onConflict: 'card_id,type' })
-          .select('id, type, level, importance, last_correct')
+          .select('id, type, level, importance, hand_set, last_correct')
           .single()
 
         if (error) return res.status(500).json({ error: error.message })
+
+        const { error: attemptErr } = await logPracticeAttempt({ skillId: data.id, encounterId: encounter_id, outcome: practice_result, model, conversation })
+        if (attemptErr) console.error('[practice_attempt] failed to log attempt', attemptErr)
+
         return res.status(200).json(data)
       }
 
+      // Manual editor (CardDetailPanel, Skills page): an explicit `level` here is a
+      // self-assessment, not an earned result, so it's marked hand_set — plan.md §5's "hand-set
+      // levels must be visually distinct from earned ones". Only touched when `level` is actually
+      // part of this PATCH (an importance-only PATCH must not flip hand_set on a level it isn't
+      // changing).
       const row = { card_id: id, type: skill_type }
-      if (level !== undefined) row.level = level
+      if (level !== undefined) {
+        row.level = level
+        row.hand_set = level !== null
+      }
       if (importance !== undefined) row.importance = importance
 
       const { data, error } = await supabase
         .from('skill')
         .upsert(row, { onConflict: 'card_id,type' })
-        .select('id, type, level, importance, last_correct')
+        .select('id, type, level, importance, hand_set, last_correct')
         .single()
 
       if (error) return res.status(500).json({ error: error.message })
       return res.status(200).json(data)
     }
 
-    if (importance === undefined) return res.status(400).json({ error: 'importance or skill_type required' })
-    if (!Number.isInteger(importance) || importance < 1 || importance > 10) {
-      return res.status(400).json({ error: 'importance must be an integer between 1 and 10' })
+    if (importance === undefined && name === undefined) return res.status(400).json({ error: 'importance, name, or skill_type required' })
+    if (importance !== undefined && (!Number.isInteger(importance) || importance < 0 || importance > 10)) {
+      return res.status(400).json({ error: 'importance must be an integer between 0 and 10' })
     }
+    if (name !== undefined && (typeof name !== 'string' || !name.trim())) {
+      return res.status(400).json({ error: 'name must be a non-empty string' })
+    }
+
+    const update = {}
+    if (importance !== undefined) update.importance = importance
+    if (name !== undefined) update.name = name.trim()
 
     const { data, error } = await supabase
       .from('knowledge_cards')
-      .update({ importance })
+      .update(update)
       .eq('project_id', project_id)
       .eq('id', id)
       .select('id, name, kind, tags, importance, details, created_at')
       .single()
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ error: `A card named "${update.name}" already exists in this project` })
+      return res.status(500).json({ error: error.message })
+    }
     return res.status(200).json(data)
   }
 
@@ -118,7 +163,7 @@ export default async function handler(req, res) {
       .from('knowledge_cards')
       .select(`
         id, name, kind, tags, importance, details, created_at,
-        skill(id, type, level, importance, last_correct),
+        skill(id, type, level, importance, hand_set, last_correct),
         source_knowledge(
           source_id,
           positions,
@@ -132,22 +177,40 @@ export default async function handler(req, res) {
     return res.status(200).json(data)
   }
 
-  let query = supabase
-    .from('knowledge_cards')
-    .select('id, name, kind, tags, importance, created_at, source_knowledge(count)', { count: 'exact' })
-    .eq('project_id', project_id)
-    .order(sort === 'recent' ? 'created_at' : 'name', { ascending: sort !== 'recent' })
-    .range(Number(offset), Number(offset) + Number(limit) - 1)
+  // `tag` (legacy, single — TagsPanel) and `tags` (new, CSV — CardsPanel's multi-select, plan.md
+  // §7) both feed browse_cards' single p_tags array (AND semantics: card must carry every tag
+  // given). browse_cards is a superset of the old plain query — see schema.sql — so the list
+  // branch always goes through it now, even when none of the §7 filters are in play.
+  const tagList = [
+    ...(tag ? [tag] : []),
+    ...(tags ? String(tags).split(',').map(t => t.trim()).filter(Boolean) : []),
+  ]
+  if (below_level !== undefined && (!Number.isInteger(Number(below_level)) || Number(below_level) < 1 || Number(below_level) > 10)) {
+    return res.status(400).json({ error: 'below_level must be an integer between 1 and 10' })
+  }
+  if (practice_state !== undefined && practice_state !== 'never_practiced' && practice_state !== 'has_failures') {
+    return res.status(400).json({ error: 'practice_state must be "never_practiced" or "has_failures"' })
+  }
 
-  if (q) query = query.ilike('name', `%${q}%`)
-  if (tag) query = query.contains('tags', [tag])
-  if (kind) query = query.eq('kind', kind)
-
-  const { data, error, count } = await query
+  const { data, error } = await supabase.rpc('browse_cards', {
+    p_project_id: project_id,
+    p_search: q || null,
+    p_kind: kind || null,
+    p_tags: tagList.length > 0 ? tagList : null,
+    p_below_level: below_level !== undefined ? Number(below_level) : null,
+    p_practice_state: practice_state || null,
+    p_sort: sort === 'recent' ? 'created' : (sort || 'name'),
+    p_sort_dir: sort_dir || (sort === 'recent' ? 'desc' : 'asc'),
+    p_limit: Number(limit),
+    p_offset: Number(offset),
+  })
   if (error) return res.status(500).json({ error: error.message })
-  const cards = data.map(({ source_knowledge, ...card }) => ({
-    ...card,
-    link_count: source_knowledge?.[0]?.count ?? 0,
+
+  const total = data[0]?.total_count ?? 0
+  const cards = data.map(({ total_count, card_id, mean_level, ...row }) => ({
+    ...row,
+    id: card_id,
+    mean_level: mean_level != null ? Number(mean_level) : null,
   }))
-  return res.status(200).json({ cards, total: count })
+  return res.status(200).json({ cards, total: Number(total) })
 }

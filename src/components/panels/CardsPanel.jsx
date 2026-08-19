@@ -1,5 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { apiFetch } from '../../apiFetch.js'
+import { SkillBadge } from '../SkillBadge.jsx'
+import { MultiSelectPopover } from '../MultiSelectPopover.jsx'
 
 const PAGE_SIZE = 25
 const KINDS = ['vocabulary', 'grammar', 'expression']
@@ -8,6 +10,24 @@ const KIND_COLORS = {
   grammar: 'bg-purple-100 text-purple-700',
   expression: 'bg-orange-100 text-orange-700',
 }
+
+// Cards panel additions (plan.md §7) — keeps the card as the unit, so sorting is only offered on
+// rollups that are well-defined for ANY card regardless of which skills it has (min/mean level,
+// last practiced across its skills) — never a bare "sort by level", which isn't (a card's skills
+// are heterogeneous). Per-skill-type sorting stays the Skills page's job.
+const SORT_OPTIONS = [
+  { value: 'name', label: 'Name' },
+  { value: 'created', label: 'Created' },
+  { value: 'importance', label: 'Importance' },
+  { value: 'link_count', label: 'Links' },
+  { value: 'min_level', label: 'Min level' },
+  { value: 'mean_level', label: 'Mean level' },
+  { value: 'last_practiced', label: 'Last practiced' },
+]
+const PRACTICE_STATE_OPTIONS = [
+  { value: 'never_practiced', label: 'Never practiced' },
+  { value: 'has_failures', label: 'Has failures' },
+]
 
 // 'all' | 'some' | 'none' — drives the card-level checkbox's checked/indeterminate state.
 // `skills` is undefined while not yet fetched (see cardSkills below) — treated as 'none'.
@@ -19,16 +39,23 @@ function skillSelectionState(skills, selectedSkills) {
   return 'some'
 }
 
-export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDragStart, onClose, onStartPractice }) {
+export function CardsPanel({ activeProject, tagCatalog, onSelectCard, selectedCardId, onDragStart, onClose, onStartPractice, refreshSignal }) {
   const [items, setItems] = useState([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState(null)
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
   const [kind, setKind] = useState(null)
+  const [tagsSelected, setTagsSelected] = useState(() => new Set())
+  const [belowLevel, setBelowLevel] = useState('')
+  const [practiceState, setPracticeState] = useState('')
+  const [sort, setSort] = useState('name')
+  const [sortDir, setSortDir] = useState('asc')
   const [page, setPage] = useState(0)
   const [refreshKey, setRefreshKey] = useState(0)
+  const scrollRef = useRef(null)
 
   // Selection is over individual skills, not cards — Map<skill.id, skill> where skill carries its
   // own `card` (embedded by /api/skills). A card's checkbox is a shortcut that selects/deselects
@@ -45,10 +72,19 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDrag
   // Any individual toggle clears it.
   const [selectAllActive, setSelectAllActive] = useState(false)
 
+  const [confirmingMerge, setConfirmingMerge] = useState(false)
+  const [merging, setMerging] = useState(false)
+  const [mergeError, setMergeError] = useState(null)
+
   useEffect(() => {
     setSearch('')
     setDebouncedSearch('')
     setKind(null)
+    setTagsSelected(new Set())
+    setBelowLevel('')
+    setPracticeState('')
+    setSort('name')
+    setSortDir('asc')
     setPage(0)
     setItems([])
     setTotal(0)
@@ -56,40 +92,81 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDrag
     setCardSkills(new Map())
     setExpandedCards(new Set())
     setSelectAllActive(false)
+    setConfirmingMerge(false)
+    setMergeError(null)
   }, [activeProject?.id])
 
   useEffect(() => {
-    const t = setTimeout(() => {
-      setDebouncedSearch(search)
-      setPage(0)
-    }, 300)
+    const t = setTimeout(() => setDebouncedSearch(search), 300)
     return () => clearTimeout(t)
   }, [search])
 
-  useEffect(() => { setPage(0) }, [kind])
+  function filterParams() {
+    const params = new URLSearchParams({ project_id: activeProject.id, sort, sort_dir: sortDir })
+    if (debouncedSearch) params.set('q', debouncedSearch)
+    if (kind) params.set('kind', kind)
+    if (tagsSelected.size > 0) params.set('tags', [...tagsSelected].join(','))
+    if (belowLevel) params.set('below_level', belowLevel)
+    if (practiceState) params.set('practice_state', practiceState)
+    return params
+  }
 
+  // Filters changed — start over from page 0, replacing whatever was loaded.
   useEffect(() => {
     if (!activeProject) return
     setLoading(true)
     setError(null)
-    const params = new URLSearchParams({
-      project_id: activeProject.id,
-      limit: PAGE_SIZE,
-      offset: page * PAGE_SIZE,
-    })
-    if (debouncedSearch) params.set('q', debouncedSearch)
-    if (kind) params.set('kind', kind)
+    const params = filterParams()
+    params.set('limit', PAGE_SIZE)
+    params.set('offset', 0)
     apiFetch(`/api/knowledge-cards?${params}`)
       .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
-      .then(({ cards, total }) => { setItems(cards); setTotal(total) })
+      .then(({ cards, total }) => { setItems(cards); setTotal(total); setPage(0) })
       .catch(e => setError(String(e)))
       .finally(() => setLoading(false))
-  }, [activeProject?.id, debouncedSearch, kind, page, refreshKey])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.id, debouncedSearch, kind, [...tagsSelected].join(','), belowLevel, practiceState, sort, sortDir, refreshKey, refreshSignal])
 
-  const pageCount = Math.ceil(total / PAGE_SIZE)
-  const rangeStart = total === 0 ? 0 : page * PAGE_SIZE + 1
-  const rangeEnd = Math.min((page + 1) * PAGE_SIZE, total)
-  const selectedCardCount = new Set(Array.from(selectedSkills.values(), s => s.card.id)).size
+  const hasMore = items.length < total
+
+  async function loadMore() {
+    if (!activeProject || loading || loadingMore || !hasMore) return
+    setLoadingMore(true)
+    const nextPage = page + 1
+    const params = filterParams()
+    params.set('limit', PAGE_SIZE)
+    params.set('offset', nextPage * PAGE_SIZE)
+    try {
+      const res = await apiFetch(`/api/knowledge-cards?${params}`)
+      if (!res.ok) throw new Error(res.statusText)
+      const { cards, total: newTotal } = await res.json()
+      setItems(prev => [...prev, ...cards])
+      setTotal(newTotal)
+      setPage(nextPage)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setLoadingMore(false)
+    }
+  }
+
+  function handleScroll(e) {
+    const el = e.currentTarget
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 150) loadMore()
+  }
+
+  // A short first page can leave the list shorter than the scroll container, so no scroll event
+  // will ever fire to trigger the next page — top it up until it either fills the container or
+  // runs out of results.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el || loading || loadingMore || !hasMore) return
+    if (el.scrollHeight <= el.clientHeight) loadMore()
+  }, [items, total, loading, loadingMore, hasMore])
+
+  const selectedCardsMap = new Map(Array.from(selectedSkills.values(), s => [s.card.id, s.card]))
+  const selectedCards = Array.from(selectedCardsMap.values())
+  const selectedCardCount = selectedCards.length
 
   async function loadCardSkills(cardId) {
     const params = new URLSearchParams({ project_id: activeProject.id, card_ids: cardId })
@@ -112,6 +189,7 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDrag
 
   function toggleSkill(skill) {
     setSelectAllActive(false)
+    setConfirmingMerge(false)
     setSelectedSkills(prev => {
       const next = new Map(prev)
       if (next.has(skill.id)) next.delete(skill.id)
@@ -122,6 +200,7 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDrag
 
   async function toggleCardAll(card) {
     setSelectAllActive(false)
+    setConfirmingMerge(false)
     const skills = cardSkills.get(card.id) ?? await loadCardSkills(card.id)
     if (skills.length === 0) return
     setSelectedSkills(prev => {
@@ -134,6 +213,7 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDrag
   }
 
   async function handleToggleSelectAll() {
+    setConfirmingMerge(false)
     if (selectAllActive) {
       setSelectedSkills(new Map())
       setSelectAllActive(false)
@@ -141,9 +221,9 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDrag
     }
     setSelectAllLoading(true)
     try {
-      const cardParams = new URLSearchParams({ project_id: activeProject.id, limit: String(total), offset: '0' })
-      if (debouncedSearch) cardParams.set('q', debouncedSearch)
-      if (kind) cardParams.set('kind', kind)
+      const cardParams = filterParams()
+      cardParams.set('limit', String(total))
+      cardParams.set('offset', '0')
       const cardsRes = await apiFetch(`/api/knowledge-cards?${cardParams}`)
       if (!cardsRes.ok) return
       const { cards: allCards } = await cardsRes.json()
@@ -177,6 +257,37 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDrag
   function handleStartPractice() {
     if (selectedSkills.size === 0) return
     onStartPractice(Array.from(selectedSkills.values(), s => ({ card: s.card, type: s.type })))
+  }
+
+  // Merges the cards currently represented in the skill selection (distinct card ids across
+  // selectedSkills) via /api/merge-cards — see schema.sql's merge_cards for the exact rules
+  // (oldest card survives, tags union, source links combine, skills collapse by type keeping the
+  // highest level). Clears selection and reloads the list on success.
+  async function handleMerge() {
+    if (selectedCards.length < 2 || !activeProject) return
+    setMerging(true)
+    setMergeError(null)
+    try {
+      const r = await apiFetch('/api/merge-cards', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: activeProject.id, card_ids: selectedCards.map(c => c.id) }),
+      })
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}))
+        throw new Error(body.error || r.statusText)
+      }
+      setSelectedSkills(new Map())
+      setSelectAllActive(false)
+      setCardSkills(new Map())
+      setExpandedCards(new Set())
+      setConfirmingMerge(false)
+      setRefreshKey(k => k + 1)
+    } catch (e) {
+      setMergeError(String(e.message || e))
+    } finally {
+      setMerging(false)
+    }
   }
 
   return (
@@ -262,9 +373,60 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDrag
             </button>
           )}
         </div>
+
+        <div className="flex items-center gap-1 flex-wrap">
+          <MultiSelectPopover
+            label="Tags"
+            options={(tagCatalog ?? []).map(t => ({ value: t.name, label: t.display_name || t.name, count: t.card_count }))}
+            selected={tagsSelected}
+            onToggle={value => setTagsSelected(prev => {
+              const next = new Set(prev)
+              if (next.has(value)) next.delete(value)
+              else next.add(value)
+              return next
+            })}
+          />
+          <input
+            type="number"
+            min={1}
+            max={10}
+            value={belowLevel}
+            onChange={e => setBelowLevel(e.target.value)}
+            placeholder="Level ≤"
+            title="Show cards with any skill at or below this level"
+            className="w-14 text-[10px] bg-gray-100 text-gray-600 rounded px-1 py-0.5 border-none focus:outline-none focus:ring-1 focus:ring-blue-400 placeholder-gray-400"
+          />
+          {PRACTICE_STATE_OPTIONS.map(opt => (
+            <button
+              key={opt.value}
+              onClick={() => setPracticeState(prev => prev === opt.value ? '' : opt.value)}
+              className={`text-[10px] rounded px-1.5 py-0.5 transition-colors ${practiceState === opt.value ? 'bg-blue-100 text-blue-700 font-medium' : 'bg-gray-100 text-gray-500 hover:bg-gray-200'}`}
+            >
+              {opt.label}
+            </button>
+          ))}
+          <span className="ml-auto flex items-center gap-1 shrink-0">
+            <select
+              value={sort}
+              onChange={e => setSort(e.target.value)}
+              className="text-[10px] bg-gray-100 text-gray-600 rounded px-1 py-0.5 border-none focus:outline-none focus:ring-1 focus:ring-blue-400"
+            >
+              {SORT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+            </select>
+            <button
+              onClick={() => setSortDir(d => d === 'asc' ? 'desc' : 'asc')}
+              title={sortDir === 'asc' ? 'Ascending' : 'Descending'}
+              className="text-gray-400 hover:text-gray-600 transition-colors"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className={`w-3 h-3 transition-transform ${sortDir === 'desc' ? 'rotate-180' : ''}`}>
+                <path d="M12 19V5M5 12l7-7 7 7" />
+              </svg>
+            </button>
+          </span>
+        </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto" ref={scrollRef} onScroll={handleScroll}>
         {loading && items.length === 0 && (
           <p className="text-xs text-gray-400 text-center mt-8">Loading…</p>
         )}
@@ -321,6 +483,7 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDrag
                       <span className="text-[10px] text-gray-400">+{item.tags.length - 3}</span>
                     )}
                     <span className="ml-auto flex items-center gap-2 shrink-0">
+                      <SkillBadge card={item} skills={item.skills} />
                       <span title="Linked sources" className="flex items-center gap-0.5 text-[10px] text-gray-400">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-2.5 h-2.5">
                           <path d="M10 13a5 5 0 007.07 0l1.93-1.93a5 5 0 00-7.07-7.07L10.5 5.5" />
@@ -362,45 +525,64 @@ export function CardsPanel({ activeProject, onSelectCard, selectedCardId, onDrag
             </div>
           )
         })}
+        {loadingMore && (
+          <p className="text-[10px] text-gray-400 text-center py-2">Loading more…</p>
+        )}
       </div>
 
       {selectedSkills.size > 0 && (
-        <div className="px-3 py-2 border-t bg-white flex items-center gap-2 shrink-0">
-          <span className="text-[10px] text-gray-500 shrink-0">
-            {selectedSkills.size} skill{selectedSkills.size > 1 ? 's' : ''} selected ({selectedCardCount} card{selectedCardCount > 1 ? 's' : ''})
-          </span>
-          <button
-            onClick={handleStartPractice}
-            className="text-[10px] font-medium bg-blue-600 text-white rounded px-2.5 py-1 hover:bg-blue-700 transition-colors shrink-0 ml-auto"
-          >
-            Practice
-          </button>
+        <div className="border-t bg-white shrink-0">
+          <div className="px-3 py-2 flex items-center gap-2">
+            <span className="text-[10px] text-gray-500 shrink-0">
+              {selectedSkills.size} skill{selectedSkills.size > 1 ? 's' : ''} selected ({selectedCardCount} card{selectedCardCount > 1 ? 's' : ''})
+            </span>
+            <div className="ml-auto flex items-center gap-2 shrink-0">
+              {selectedCardCount >= 2 && (
+                <button
+                  onClick={() => { setMergeError(null); setConfirmingMerge(true) }}
+                  className="text-[10px] font-medium bg-amber-600 text-white rounded px-2.5 py-1 hover:bg-amber-700 transition-colors"
+                >
+                  Merge {selectedCardCount} cards
+                </button>
+              )}
+              <button
+                onClick={handleStartPractice}
+                className="text-[10px] font-medium bg-blue-600 text-white rounded px-2.5 py-1 hover:bg-blue-700 transition-colors"
+              >
+                Practice
+              </button>
+            </div>
+          </div>
+          {confirmingMerge && (
+            <div className="px-3 pb-2 pt-1 border-t border-amber-100 bg-amber-50/50 space-y-1.5">
+              <p className="text-[10px] text-gray-600">
+                Merge these {selectedCardCount} cards into the oldest one? Tags are unioned, source links are combined, and for each skill type only the highest level is kept. The other cards are deleted. This cannot be undone.
+              </p>
+              <ul className="text-[10px] text-gray-500 list-disc pl-4 max-h-16 overflow-y-auto">
+                {selectedCards.map(c => <li key={c.id}>{c.name}</li>)}
+              </ul>
+              {mergeError && <p className="text-[10px] text-red-500">{mergeError}</p>}
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleMerge}
+                  disabled={merging}
+                  className="text-[10px] font-medium text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-60 rounded px-2 py-1 shrink-0 transition-colors"
+                >
+                  {merging ? 'Merging…' : 'Confirm merge'}
+                </button>
+                <button
+                  onClick={() => setConfirmingMerge(false)}
+                  disabled={merging}
+                  className="text-[10px] text-gray-500 hover:text-gray-700 disabled:opacity-60 rounded px-2 py-1 shrink-0 transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
-      {total > PAGE_SIZE && (
-        <div className="px-3 py-2 border-t bg-white flex items-center justify-between shrink-0">
-          <button
-            onClick={() => setPage(p => p - 1)}
-            disabled={page === 0}
-            className="text-gray-400 hover:text-gray-600 disabled:opacity-30 disabled:cursor-default transition-colors"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
-              <polyline points="15 18 9 12 15 6" />
-            </svg>
-          </button>
-          <span className="text-[10px] text-gray-400">{rangeStart}–{rangeEnd} of {total}</span>
-          <button
-            onClick={() => setPage(p => p + 1)}
-            disabled={page >= pageCount - 1}
-            className="text-gray-400 hover:text-gray-600 disabled:opacity-30 disabled:cursor-default transition-colors"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
-              <polyline points="9 18 15 12 9 6" />
-            </svg>
-          </button>
-        </div>
-      )}
     </div>
   )
 }

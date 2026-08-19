@@ -23,11 +23,13 @@ function shuffle(arr) {
 async function pickSubstituteSkill(projectId) {
   const types = practiceableSkillTypes()
   if (types.length === 0) return null
+  // Retired (level = 10, plan.md §5) skills are never auto-selected, substitution included.
   const { data } = await supabase
     .from('skill')
     .select('card_id, type, level, knowledge_cards!inner(id, name, kind, tags, details, project_id)')
     .eq('knowledge_cards.project_id', projectId)
     .in('type', types)
+    .or('level.is.null,level.neq.10')
     .limit(200)
   if (!data || data.length === 0) return null
   const row = data[Math.floor(Math.random() * data.length)]
