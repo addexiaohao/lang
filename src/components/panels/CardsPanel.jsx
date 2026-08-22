@@ -525,8 +525,12 @@ export function CardsPanel({ activeProject, tagCatalog, onSelectCard, selectedCa
             </div>
           )
         })}
-        {loadingMore && (
-          <p className="text-[10px] text-gray-400 text-center py-2">Loading more…</p>
+        {items.length > 0 && (
+          <p className="text-[10px] text-gray-400 text-center py-2">
+            {loadingMore
+              ? 'Loading more…'
+              : `${items.length} above · ${Math.max(total - items.length, 0)} left`}
+          </p>
         )}
       </div>
 

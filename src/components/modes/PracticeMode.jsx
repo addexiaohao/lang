@@ -35,6 +35,7 @@ export function PracticeMode({
               activeProject={activeProject}
               practiceSession={practiceSession}
               onClose={onEndSession}
+              onStartPractice={onStartPractice}
               onSidePanelCountChange={setOpenSidePanels}
               generatedContext={generatedContext}
               tagCatalog={tagCatalog}

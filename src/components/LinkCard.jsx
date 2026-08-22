@@ -1,15 +1,22 @@
 import { forwardRef, useImperativeHandle, useState } from 'react'
 import { HighlightedText } from './HighlightedText.jsx'
 import AnnotatedSpanEditor from './AnnotatedSpanEditor.jsx'
+import SenseSelector from './SenseSelector.jsx'
 import { stripMarkers, applyMarkers } from '../../lib/annotationMarkers.js'
 
-const LinkCard = forwardRef(function LinkCard({ record, linkState = { status: 'idle' }, onLink, sourceId, annotatedSentence, onAnnotatedSentenceChange }, ref) {
-  useImperativeHandle(ref, () => ({ save: onLink }))
+const LinkCard = forwardRef(function LinkCard({ record, linkState = { status: 'idle' }, onLink, existingId, senseProposal, sourceId, annotatedSentence, onAnnotatedSentenceChange }, ref) {
+  // undefined = an incomplete "new sense" form (SenseSelector reports this to disable Link, not to
+  // omit sense fields — distinct from null, "plain link, no sense fields needed").
+  const [senseFields, setSenseFields] = useState(null)
+  function handleSaveClick() {
+    onLink(senseFields === undefined ? null : senseFields)
+  }
+  useImperativeHandle(ref, () => ({ save: handleSaveClick }))
 
   const { status, error } = linkState
   const isLinked = status === 'linked'
   const isLinking = status === 'linking'
-  const isDisabled = !sourceId || isLinking || isLinked
+  const isDisabled = !sourceId || isLinking || isLinked || senseFields === undefined
 
   const [editingSpan, setEditingSpan] = useState(false)
   let sentenceInfo = null
@@ -28,7 +35,7 @@ const LinkCard = forwardRef(function LinkCard({ record, linkState = { status: 'i
           Existing Card
         </span>
         <button
-          onClick={onLink}
+          onClick={handleSaveClick}
           disabled={isDisabled}
           className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${
             isLinked
@@ -66,6 +73,8 @@ const LinkCard = forwardRef(function LinkCard({ record, linkState = { status: 'i
           </div>
         )}
       </div>
+
+      <SenseSelector existingId={existingId} kind={record.kind} proposal={senseProposal} onChange={setSenseFields} />
 
       {sentenceInfo && (
         <div className="rounded-md bg-white border border-gray-200 px-2 py-1.5 space-y-1.5">

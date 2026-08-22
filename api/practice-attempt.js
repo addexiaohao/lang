@@ -1,6 +1,6 @@
 import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
-import { validateSkillType } from '../lib/skillTypes.js'
+import { validateSkillType, skillDbColumns } from '../lib/skillTypes.js'
 import { logPracticeAttempt } from '../lib/practiceAttempts.js'
 
 // Logs a practice_attempt row that does NOT touch skill.level/last_correct — currently only the
@@ -43,11 +43,13 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: `"${skill_type}" is not a valid skill type for this card` })
   }
 
+  const { type: dbType, sense_type: dbSenseType } = skillDbColumns(card, skill_type)
   const { data: skillRow, error: skillErr } = await supabase
     .from('skill')
     .select('id')
     .eq('card_id', card_id)
-    .eq('type', skill_type)
+    .eq('type', dbType)
+    .eq('sense_type', dbSenseType)
     .maybeSingle()
   if (skillErr) return res.status(500).json({ error: skillErr.message })
   if (!skillRow) return res.status(404).json({ error: 'Skill not found' })

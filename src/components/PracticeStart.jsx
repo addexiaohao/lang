@@ -1,12 +1,13 @@
 import { useState } from 'react'
 import { apiFetch } from '../apiFetch.js'
+import { fetchQuickStartSkills } from '../practiceQuickStart.js'
 
 // Practice-entry path 2 (plan.md B5): quick-start with no picking. Samples skill rows
 // project-wide (skills are the practice unit now, not cards — see lib/practiceRules.js and
-// CLAUDE.md's "Skills" section), excluding anything answered correctly in the past
-// EXCLUDE_RECENT_DAYS (see api/skills.js), weighted by importance rather than sorted by
-// recency — see api/skills.js's `sort=weighted` mode for the actual sampling.
-const QUICK_START_COUNT = 10
+// CLAUDE.md's "Skills" section) via the spaced-repetition scheduler (lib/practiceSelection.js's
+// selectScheduledPracticeSkills — plan.md "Practice Scheduling") rather than sorted by recency —
+// see api/skills.js's `sort=weighted` mode for the actual selection. The fetch itself lives in
+// ../practiceQuickStart.js, shared with PracticePanel.jsx's "More practice" button.
 
 // "Random" is the same quick-start idea (plan.md B5: "most recently added N, or a random
 // selection") but sampling uniformly across every skill in the project instead of just the
@@ -39,20 +40,8 @@ export function PracticeStart({ activeProject, onStart, onBrowse }) {
     setLoading(true)
     setError(null)
     try {
-      const params = new URLSearchParams({
-        project_id: activeProject.id,
-        sort: 'weighted',
-        limit: String(QUICK_START_COUNT),
-      })
-      const res = await apiFetch(`/api/skills?${params}`)
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok) throw new Error(data.error ?? 'Failed to load skills')
-      const skills = (data.skills ?? []).map(toSkill)
-      if (skills.length === 0) {
-        setError('No skills yet — save some cards from Learn first.')
-        return
-      }
-      onStart(skills)
+      const { skills, meta } = await fetchQuickStartSkills(activeProject)
+      onStart(skills, meta)
     } catch (e) {
       setError(e.message)
     } finally {
@@ -122,7 +111,8 @@ export function PracticeStart({ activeProject, onStart, onBrowse }) {
         <button
           onClick={handleRandomStart}
           disabled={randomLoading || !activeProject}
-          className="text-sm font-medium bg-purple-600 text-white rounded-lg px-4 py-1.5 hover:bg-purple-700 disabled:opacity-40 transition-colors"
+          title="Uniform random pick — ignores importance, level, and recency. Quick practice is the smarter default."
+          className="text-sm font-medium text-gray-400 border border-gray-200 rounded-lg px-4 py-1.5 hover:bg-gray-50 hover:text-gray-500 disabled:opacity-40 transition-colors"
         >
           {randomLoading ? 'Loading…' : 'Random'}
         </button>

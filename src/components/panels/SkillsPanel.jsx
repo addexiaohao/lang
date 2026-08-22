@@ -25,6 +25,7 @@ const SORT_OPTIONS = [
   { value: 'importance', label: 'Importance' },
   { value: 'name', label: 'Name' },
   { value: 'created', label: 'Created' },
+  { value: 'last_result', label: 'Last result' },
 ]
 
 // Marker colour + row-dimming per plan.md §1. never_practiced is deliberately NOT colour-coded —
@@ -167,20 +168,39 @@ function ImportanceBadge({ importance }) {
   )
 }
 
+// Right/wrong/never-tested at a glance — a simpler sibling of the practice_state dot (which
+// outranks a too_hard encounter ahead of failing). This is just "what happened last time":
+// correct -> right, incorrect or too_hard -> wrong, null -> never tested. Same 3-way split the
+// 'last_result' sort orders by.
+function LastResultIcon({ lastOutcome }) {
+  if (lastOutcome == null) {
+    return <span title="Never tested" className="w-3.5 text-center text-[10px] text-gray-300 shrink-0">–</span>
+  }
+  if (lastOutcome === 'correct') {
+    return <span title="Correct last time" className="w-3.5 text-center text-[11px] font-bold text-green-600 shrink-0">✓</span>
+  }
+  return (
+    <span
+      title={lastOutcome === 'too_hard' ? 'Too hard last time' : 'Incorrect last time'}
+      className="w-3.5 text-center text-[11px] font-bold text-red-500 shrink-0"
+    >
+      ✗
+    </span>
+  )
+}
+
 function formatDate(iso) {
   return new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })
 }
 
-// Row expansion (plan.md §6) — fetched lazily on first expand, cached per skill. `attempt` is
-// null while loading, `false` once loaded-but-none-found, or the practice_attempt row.
-function ExpandedRow({ attempt }) {
+// One practice_attempt entry within the expanded history — same heading (outcome badge, date,
+// model) and response/prompt disclosure the single-attempt view used to show, just repeated once
+// per attempt now that the row expands to the full history rather than only the latest round.
+function AttemptRow({ attempt }) {
   const [showPrompt, setShowPrompt] = useState(false)
-  if (attempt === undefined) return <p className="text-[10px] text-gray-400 py-2 px-3">Loading…</p>
-  if (!attempt) return <p className="text-[10px] text-gray-400 py-2 px-3">No attempts yet.</p>
-
   const response = attempt.conversation?.response
   return (
-    <div className="px-3 py-2 space-y-2 bg-gray-50/60 border-t border-gray-100">
+    <div className="space-y-2">
       <div className="flex items-center gap-2">
         <span className={`text-[10px] font-medium rounded px-1.5 py-0.5 ${
           attempt.outcome === 'correct' ? 'bg-green-100 text-green-700'
@@ -212,6 +232,24 @@ function ExpandedRow({ attempt }) {
   )
 }
 
+// Row expansion (plan.md §6) — fetched lazily on first expand, cached per skill. `attempts` is
+// undefined while loading, or the full (possibly empty) list of practice_attempt rows, most
+// recent first.
+function ExpandedRow({ attempts }) {
+  if (attempts === undefined) return <p className="text-[10px] text-gray-400 py-2 px-3">Loading…</p>
+  if (attempts.length === 0) return <p className="text-[10px] text-gray-400 py-2 px-3">No attempts yet.</p>
+
+  return (
+    <div className="px-3 py-2 space-y-3 bg-gray-50/60 border-t border-gray-100 divide-y divide-gray-100">
+      {attempts.map(attempt => (
+        <div key={attempt.id} className="pt-3 first:pt-0">
+          <AttemptRow attempt={attempt} />
+        </div>
+      ))}
+    </div>
+  )
+}
+
 export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragStart, onClose }) {
   const [items, setItems] = useState([])
   const [total, setTotal] = useState(0)
@@ -235,6 +273,8 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
   const [expandedId, setExpandedId] = useState(null)
   const [attemptCache, setAttemptCache] = useState(() => new Map())
   const [savingId, setSavingId] = useState(null)
+  const listRequestId = useRef(0)
+  const histogramRequestId = useRef(0)
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 300)
@@ -251,9 +291,12 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
     return params
   }
 
-  // Filters/sort changed — start over from the top.
+  // Filters/sort changed — start over from the top. Requests can resolve out of order (an
+  // unfiltered/slower query outrunning a filtered/faster one fired just after it), so a
+  // monotonic request id guards against a stale response clobbering a newer filter's result.
   useEffect(() => {
     if (!activeProject) return
+    const requestId = ++listRequestId.current
     setLoading(true)
     setError(null)
     const params = filterParams()
@@ -265,20 +308,24 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
     params.set('browse', '1')
     apiFetch(`/api/skills?${params}`)
       .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
-      .then(({ skills, total }) => { setItems(skills); setTotal(total) })
-      .catch(e => setError(String(e)))
-      .finally(() => setLoading(false))
+      .then(({ skills, total }) => {
+        if (requestId !== listRequestId.current) return
+        setItems(skills); setTotal(total)
+      })
+      .catch(e => { if (requestId === listRequestId.current) setError(String(e)) })
+      .finally(() => { if (requestId === listRequestId.current) setLoading(false) })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProject?.id, debouncedSearch, kind, skillType, [...states].join(','), [...tagsSelected].join(','), levelFilter, sort, sortDir, refreshKey])
 
-  // Histogram — same filters minus level (plan.md §4).
+  // Histogram — same filters minus level (plan.md §4). Same stale-response guard as the list fetch.
   useEffect(() => {
     if (!activeProject) return
+    const requestId = ++histogramRequestId.current
     const params = filterParams()
     params.set('histogram', '1')
     apiFetch(`/api/skills?${params}`)
       .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
-      .then(({ histogram }) => setHistogram(histogram))
+      .then(({ histogram }) => { if (requestId === histogramRequestId.current) setHistogram(histogram) })
       .catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProject?.id, debouncedSearch, kind, skillType, [...states].join(','), [...tagsSelected].join(','), refreshKey])
@@ -288,6 +335,7 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
   async function loadMore() {
     if (!activeProject || loading || loadingMore || !hasMore) return
     setLoadingMore(true)
+    const requestId = listRequestId.current
     const params = filterParams()
     if (levelFilter != null) { params.set('level_min', levelFilter); params.set('level_max', levelFilter) }
     params.set('sort', sort)
@@ -299,10 +347,11 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
       const res = await apiFetch(`/api/skills?${params}`)
       if (!res.ok) throw new Error(res.statusText)
       const { skills, total: newTotal } = await res.json()
+      if (requestId !== listRequestId.current) return
       setItems(prev => [...prev, ...skills])
       setTotal(newTotal)
     } catch (e) {
-      setError(String(e))
+      if (requestId === listRequestId.current) setError(String(e))
     } finally {
       setLoadingMore(false)
     }
@@ -342,9 +391,9 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
     const id = row.id
     setExpandedId(prev => prev === id ? null : id)
     if (expandedId === id || attemptCache.has(id)) return
-    const params = new URLSearchParams({ project_id: activeProject.id, last_attempt_for: id })
+    const params = new URLSearchParams({ project_id: activeProject.id, history_for: id })
     const res = await apiFetch(`/api/skills?${params}`)
-    const data = res.ok ? await res.json().catch(() => null) : null
+    const data = res.ok ? await res.json().catch(() => []) : []
     setAttemptCache(prev => new Map(prev).set(id, data))
   }
 
@@ -540,17 +589,24 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
                   </div>
                 </div>
                 {row.level === 10 && <span className="text-[9px] text-gray-400 shrink-0" title="Retired — never auto-selected by practice">retired</span>}
+                <LastResultIcon lastOutcome={row.last_outcome} />
                 <LevelMarker row={row} onSet={v => setLevel(row, v)} saving={savingId === row.id} />
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"
                   className={`w-2.5 h-2.5 text-gray-300 shrink-0 transition-transform ${expanded ? 'rotate-90' : ''}`}>
                   <polyline points="9 18 15 12 9 6" />
                 </svg>
               </div>
-              {expanded && <ExpandedRow attempt={attemptCache.get(row.id)} />}
+              {expanded && <ExpandedRow attempts={attemptCache.get(row.id)} />}
             </div>
           )
         })}
-        {loadingMore && <p className="text-[10px] text-gray-400 text-center py-2">Loading more…</p>}
+        {items.length > 0 && (
+          <p className="text-[10px] text-gray-400 text-center py-2">
+            {loadingMore
+              ? 'Loading more…'
+              : `${items.length} above · ${Math.max(total - items.length, 0)} left`}
+          </p>
+        )}
       </div>
     </div>
   )

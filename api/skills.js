@@ -1,7 +1,21 @@
 import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
-import { selectQuickPracticeSkills } from '../lib/practiceSelection.js'
+import { selectScheduledPracticeSkills, RETIRED_LEVEL } from '../lib/practiceSelection.js'
+import { FAILURE_CAP } from '../lib/practiceScheduling.js'
 import { PRACTICE_STATES } from '../lib/practiceStates.js'
+import { resolveSkillType } from '../lib/skillTypes.js'
+
+// A sense skill's DB `type` is always literally 'meaning' (see lib/skillTypes.js's sense_type
+// column comment) — every raw `skill` row read below resolves it to the ONE external skill_type
+// string every consumer (CardsPanel, PracticeStart, lib/practiceSelection.js's gating) expects,
+// same as schema.sql's skill_practice_state() already does for the browse_skills/browse_cards path.
+// `dbType` is kept alongside (not stripped) — lib/skillTypes.js's isGateSatisfied() needs the
+// literal DB type (e.g. every sense of a sense-split card is still DB type 'meaning') to match a
+// gate's prereqType, which the resolved external type (a sense key) can't do.
+function resolveRow(row) {
+  const { sense_type, ...s } = row
+  return { ...s, type: resolveSkillType(row), dbType: row.type }
+}
 
 // Lists `skill` rows project-wide, each with its owning card embedded — skills are the practice
 // unit now (see lib/practiceRules.js), so the practice pickers need them as first-class rows
@@ -10,29 +24,27 @@ import { PRACTICE_STATES } from '../lib/practiceStates.js'
 //                              card, practice all its skills")
 //   ?sort=recent&limit=N   -> the N most-recently-created skill rows project-wide
 //   ?sort=weighted&limit=N -> quick-start: every card in the project is loaded ONCE, each with its
-//                              full skill set, then N skills are selected via
-//                              lib/practiceSelection.js's two-stage weighted sample (card by
-//                              importance, then skill on that card by
-//                              lib/practiceSelection.js's SKILL_SELECTION_WEIGHTS) — skills whose
-//                              `last_correct` falls in the past EXCLUDE_RECENT_DAYS days are
-//                              ineligible to be picked, though still count toward sibling-skill
-//                              gating (e.g. "gender" behind "meaning") — see that file
+//                              full skill set (including its scheduling fields and last-attempt
+//                              timestamp), then N skills are selected via
+//                              lib/practiceSelection.js's selectScheduledPracticeSkills —
+//                              plan.md ("Practice Scheduling")'s bucketing (relearning > overdue
+//                              stable > never), importance/staleness weighting, gating, cooldown,
+//                              and same-card/same-type interleaving. The response also carries
+//                              `relearning_count`/`failure_cap`/`cap_hit` (plan.md §4) so the
+//                              client can surface "no new words until this shrinks".
 //   ?limit=1&offset=N      -> single row at offset N, for uniform random sampling (random-start),
 //                              same pattern api/knowledge-cards.js uses for cards
 //   ?browse=1&...          -> Skills page (plan.md): filtered/sorted/paginated rows with derived
 //                              practice state, via schema.sql's browse_skills RPC — see below
 //   ?histogram=1&...       -> Skills page's level histogram, via skill_level_histogram RPC
-//   ?last_attempt_for=id   -> the single most recent practice_attempt row for one skill (row
+//   ?history_for=id        -> every practice_attempt row for one skill, most recent first (row
 //                              expansion, plan.md §6) — the only path that returns `conversation`,
 //                              since list queries deliberately omit that large blob (plan.md §8)
 //
-// Both the weighted quick-start pool and the plain (random-start) listing exclude level = 10
-// skills — "retired" (plan.md §5: "Setting 10 should read as retired — never selected by
-// practice"). This only applies to these two auto-selection paths, not to `card_ids` (CardsPanel's
-// own browsing/selection, where a retired skill should still be visible and manually pickable).
-const EXCLUDE_RECENT_DAYS = 5
-const RETIRED_LEVEL = 10
-
+// Both the weighted quick-start pool and the plain (random-start) listing exclude retired skills
+// (scheduling `state = 'retired'`, i.e. level = 10 — plan.md §1/§5: never selected by practice).
+// This only applies to these two auto-selection paths, not to `card_ids` (CardsPanel's own
+// browsing/selection, where a retired skill should still be visible and manually pickable).
 export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
 
@@ -46,7 +58,7 @@ export default async function handler(req, res) {
 
   const {
     project_id, card_ids, sort, limit = '20', offset = '0',
-    browse, histogram, last_attempt_for,
+    browse, histogram, history_for,
     skill_type, level_min, level_max, state, kind, tags, q, sort_dir,
   } = req.query
   if (!project_id) return res.status(400).json({ error: 'project_id required' })
@@ -58,15 +70,15 @@ export default async function handler(req, res) {
     throw e
   }
 
-  // Row expansion (plan.md §6): the one most recent practice_attempt for a single skill, including
-  // its `conversation` blob — the only place this endpoint returns that (list queries omit it,
-  // plan.md §8). Ownership verified in a separate step (skill -> knowledge_cards.project_id, same
-  // pattern api/practice-attempt.js uses) rather than a double-nested embedded filter.
-  if (last_attempt_for) {
+  // Row expansion (plan.md §6): every practice_attempt for a single skill, most recent first,
+  // including its `conversation` blob — the only place this endpoint returns that (list queries
+  // omit it, plan.md §8). Ownership verified in a separate step (skill -> knowledge_cards.project_id,
+  // same pattern api/practice-attempt.js uses) rather than a double-nested embedded filter.
+  if (history_for) {
     const { data: skillRow, error: skillErr } = await supabase
       .from('skill')
       .select('id, knowledge_cards!inner(project_id)')
-      .eq('id', last_attempt_for)
+      .eq('id', history_for)
       .eq('knowledge_cards.project_id', project_id)
       .maybeSingle()
     if (skillErr) return res.status(500).json({ error: skillErr.message })
@@ -75,12 +87,10 @@ export default async function handler(req, res) {
     const { data, error } = await supabase
       .from('practice_attempt')
       .select('id, encounter_id, outcome, model, conversation, created_at')
-      .eq('skill_id', last_attempt_for)
+      .eq('skill_id', history_for)
       .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle()
     if (error) return res.status(500).json({ error: error.message })
-    return res.status(200).json(data ?? null)
+    return res.status(200).json(data ?? [])
   }
 
   if (histogram) {
@@ -127,27 +137,39 @@ export default async function handler(req, res) {
   }
 
   if (sort === 'weighted') {
-    // One round trip for the whole candidate pool — cards with their full skill sets attached —
-    // so lib/practiceSelection.js can re-select as many times as it needs (a card with nothing
+    // Two round trips for the whole candidate pool — cards with their full skill sets attached,
+    // plus each skill's most recent practice_attempt timestamp (for the cooldown check) — so
+    // lib/practiceSelection.js can re-select as many times as it needs (a card with nothing
     // practiceable right now just gets dropped in memory) without going back to the DB.
-    const { data, error, count } = await supabase
-      .from('knowledge_cards')
-      .select('id, name, kind, tags, details, importance, skill(id, type, level, importance, last_correct)', { count: 'exact' })
-      .eq('project_id', project_id)
+    const [{ data, error, count }, { data: lastAttempts, error: lastAttemptsErr }] = await Promise.all([
+      supabase
+        .from('knowledge_cards')
+        .select('id, name, kind, tags, details, importance, skill(id, type, sense_type, level, importance, last_correct, state, interval_days, due_at, consecutive_correct)', { count: 'exact' })
+        .eq('project_id', project_id),
+      supabase.rpc('skill_last_attempt', { p_project_id: project_id }),
+    ])
     if (error) return res.status(500).json({ error: error.message })
+    if (lastAttemptsErr) return res.status(500).json({ error: lastAttemptsErr.message })
 
-    const cards = data.map(({ skill, ...card }) => ({ ...card, skills: skill }))
-    const cutoff = new Date(Date.now() - EXCLUDE_RECENT_DAYS * 24 * 60 * 60 * 1000)
-    const eligible = (s) => s.level !== RETIRED_LEVEL && (!s.last_correct || new Date(s.last_correct) < cutoff)
-
-    const picks = selectQuickPracticeSkills(cards, Number(limit), eligible)
+    const lastAttemptById = new Map((lastAttempts ?? []).map((r) => [r.skill_id, r.last_attempt_at]))
+    const cards = data.map(({ skill, ...card }) => ({
+      ...card,
+      skills: skill.map((row) => ({ ...resolveRow(row), last_attempt_at: lastAttemptById.get(row.id) ?? null })),
+    }))
+    const { picks, relearningCount, capHit } = selectScheduledPracticeSkills(cards, Number(limit))
     const skills = picks.map(({ card: { skills: _skills, ...card }, skill }) => ({ ...skill, card }))
-    return res.status(200).json({ skills, total: count })
+    return res.status(200).json({
+      skills,
+      total: count,
+      relearning_count: relearningCount,
+      failure_cap: FAILURE_CAP,
+      cap_hit: capHit,
+    })
   }
 
   let query = supabase
     .from('skill')
-    .select('id, type, level, importance, last_correct, knowledge_cards!inner(id, name, kind, tags, details, project_id)', { count: 'exact' })
+    .select('id, type, sense_type, level, importance, last_correct, knowledge_cards!inner(id, name, kind, tags, details, project_id)', { count: 'exact' })
     .eq('knowledge_cards.project_id', project_id)
 
   if (card_ids) {
@@ -165,6 +187,6 @@ export default async function handler(req, res) {
 
   const { data, error, count } = await query
   if (error) return res.status(500).json({ error: error.message })
-  const skills = data.map(({ knowledge_cards, ...s }) => ({ ...s, card: knowledge_cards }))
+  const skills = data.map(({ knowledge_cards, ...s }) => ({ ...resolveRow(s), card: knowledge_cards }))
   return res.status(200).json({ skills, total: count })
 }

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { apiFetch } from '../../apiFetch.js'
+import { fetchQuickStartSkills } from '../../practiceQuickStart.js'
 import { MAX_EASIER_SENTENCE_ATTEMPTS } from '../../../lib/practiceRules.js'
 import PracticeMcCloze from '../PracticeMcCloze.jsx'
 import PracticeSpelling from '../PracticeSpelling.jsx'
@@ -16,9 +17,16 @@ import { ChatPanel } from './ChatPanel.jsx'
 // skill.
 // Nothing here persists — reload or close and the session is gone, by design (see CLAUDE.md /
 // practice-prototype-plan.md hard constraints).
-export function PracticePanel({ activeProject, practiceSession, onDragStart, onClose, onSidePanelCountChange, generatedContext, tagCatalog, onNewTags }) {
-  const { skills } = practiceSession
+export function PracticePanel({ activeProject, practiceSession, onDragStart, onClose, onSidePanelCountChange, onStartPractice, generatedContext, tagCatalog, onNewTags }) {
+  const { skills, capNotice } = practiceSession
+  // End-of-session "More practice" button state (see handleRestart below) — separate from
+  // `loading`, which is about generating the current item, not fetching a new selection.
+  const [restarting, setRestarting] = useState(false)
+  const [restartError, setRestartError] = useState(null)
   const [index, setIndex] = useState(0)
+  // plan.md §4's failure-cap notice ("working through N tricky ones — no new words until this
+  // shrinks") — surfaced once per session, dismissible, not re-shown once closed.
+  const [capNoticeDismissed, setCapNoticeDismissed] = useState(false)
   const [current, setCurrent] = useState(null)
   const [sentenceCount, setSentenceCount] = useState(1)
   const [loading, setLoading] = useState(true)
@@ -225,7 +233,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     }
   }, [skills, requestItem])
 
-  // (Re)start whenever a new session is handed in (new selection, or "Practice again").
+  // (Re)start whenever a new session is handed in (new selection, or "More practice").
   useEffect(() => {
     sessionKeyRef.current += 1
     prefetchRef.current = {}
@@ -328,20 +336,25 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     }
   }
 
-  function handleRestart() {
-    sessionKeyRef.current += 1
-    prefetchRef.current = {}
-    cardDetailCacheRef.current = {}
-    setIndex(0)
-    setSentenceCount(1)
-    setFinished(false)
-    setCardOpen(false)
-    setCardDetails({})
-    setLevelChange(null)
-    setResults({})
-    setEasierCount(0)
-    setItemHistory([])
-    loadCurrent(0)
+  // "More practice" (EndOfSession's button) — fetches a genuinely fresh scheduler-respecting
+  // selection (same as PracticeStart's "Quick practice") rather than replaying `practiceSession`'s
+  // existing `skills` list unchanged: a skill just answered correctly here has its due_at pushed
+  // out, so blindly re-running the same list could immediately re-serve it minutes later, before
+  // it was ever due again. Handing the result to `onStartPractice` replaces the parent's
+  // `practiceSession` with a new object, which the `[practiceSession]` effect above picks up to do
+  // the actual reset + loadCurrent(0).
+  async function handleRestart() {
+    if (!activeProject) return
+    setRestarting(true)
+    setRestartError(null)
+    try {
+      const { skills: newSkills, meta } = await fetchQuickStartSkills(activeProject)
+      onStartPractice(newSkills, meta)
+    } catch (e) {
+      setRestartError(e.message)
+    } finally {
+      setRestarting(false)
+    }
   }
 
   // Regenerates the item currently on screen for the exact same skill, continuing this skill's
@@ -442,9 +455,24 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
           )}
         </div>
 
+        {capNotice && !capNoticeDismissed && (
+          <div className="px-3 py-1.5 bg-amber-50 border-b border-amber-100 flex items-center justify-between gap-2 shrink-0">
+            <p className="text-[11px] text-amber-700">{capNotice}</p>
+            <button
+              onClick={() => setCapNoticeDismissed(true)}
+              aria-label="Dismiss"
+              className="text-amber-400 hover:text-amber-600 transition-colors shrink-0"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3">
+                <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
+        )}
+
         <div className="flex-1 min-h-0 overflow-hidden">
           {finished ? (
-            <EndOfSession skills={skills} results={results} onRestart={handleRestart} />
+            <EndOfSession skills={skills} results={results} onRestart={handleRestart} restarting={restarting} restartError={restartError} />
           ) : loading ? (
             <div className="h-full flex items-center justify-center">
               <p className="text-xs text-gray-400">Generating…</p>
@@ -507,6 +535,8 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
             prefetchedDetail={cardDetails[card.id] ?? null}
             levelChange={levelChange?.cardId === card.id ? levelChange : null}
             seedInfo={current?.seed ?? null}
+            tagCatalog={tagCatalog}
+            onNewTags={onNewTags}
           />
         </div>
       )}
@@ -546,7 +576,7 @@ function AddSourceChat({ activeProject, forcedContext, tagCatalog, onNewTags, on
 // original `skills[i]`, is what's actually displayed, since a silent server-side substitution
 // (see requestItem's comment above) can mean the skill actually assessed at that index differs
 // from the one originally requested.
-function EndOfSession({ skills, results, onRestart }) {
+function EndOfSession({ skills, results, onRestart, restarting, restartError }) {
   return (
     <div className="h-full flex flex-col items-center justify-center gap-4 px-6 text-center">
       <div>
@@ -571,10 +601,12 @@ function EndOfSession({ skills, results, onRestart }) {
       </div>
       <button
         onClick={onRestart}
-        className="text-sm font-medium bg-blue-600 text-white rounded-lg px-4 py-1.5 hover:bg-blue-700 transition-colors"
+        disabled={restarting}
+        className="text-sm font-medium bg-blue-600 text-white rounded-lg px-4 py-1.5 hover:bg-blue-700 disabled:opacity-40 transition-colors"
       >
-        Practice again
+        {restarting ? 'Loading…' : 'More practice'}
       </button>
+      {restartError && <p className="text-xs text-red-500">{restartError}</p>}
     </div>
   )
 }

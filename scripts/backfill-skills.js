@@ -106,7 +106,7 @@ async function main() {
     if (!dryRun && toInsert.length > 0) {
       const { error: upsertErr } = await supabase
         .from('skill')
-        .upsert(toInsert, { onConflict: 'card_id,type', ignoreDuplicates: true })
+        .upsert(toInsert, { onConflict: 'card_id,type,sense_type', ignoreDuplicates: true })
       if (upsertErr) {
         console.error('Failed to insert skill rows:', upsertErr.message)
         process.exit(1)

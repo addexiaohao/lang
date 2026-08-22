@@ -5,6 +5,9 @@ import { getProjectConfig } from '../lib/projectConfig.js'
 import { findDuplicateSource } from '../lib/normalizeSourceText.js'
 import { compose } from '../lib/prompts/registry.js'
 import { runChatLoop } from '../lib/chatLoop.js'
+import { isSenseExempt, hasSenseAxis, senseValues, axisValueKey, axisValueGloss, axisValueExample } from '../lib/skillTypes.js'
+import { getSenseVerdict } from '../lib/senseCheck.js'
+import { languageName } from '../lib/prompts/fragments.js'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
@@ -57,19 +60,42 @@ export default async function handler(req, res) {
     return match ? [match] : []
   }
 
-  async function executeSearchKnowledgeCards(query) {
+  // For a vocabulary match, when the model gave us an excerpt (see lib/chatLoop.js's tool
+  // description), runs/consults the sense checker (lib/senseCheck.js, plan.md — "Word Senses") and
+  // attaches the card's existing sense(s) so the model can compare this encounter against them —
+  // this is the ONE place the check runs, so it can't be skipped or duplicated by the calling model.
+  // Exempt classes (prepositions, particles, etc. — lib/skillTypes.js's isSenseExempt) and cards
+  // that already have a non-sense axis (declension paradigms — sense-splitting doesn't apply) never
+  // hit the checker at all.
+  async function attachSenseInfo(card, excerpt) {
+    if (card.kind !== 'vocabulary' || !excerpt || isSenseExempt(card)) return card
+    const axes = card.details?.axes
+    if (Array.isArray(axes) && axes.length > 0 && !hasSenseAxis(card)) return card // non-sense paradigm card
+
+    const senses = hasSenseAxis(card)
+      ? senseValues(card).map(v => ({ key: axisValueKey(v), gloss: axisValueGloss(v), example: axisValueExample(v) }))
+      : null // monosemous so far — no senses on file yet, but still eligible to become one
+
+    const { verdict, reasoning } = await getSenseVerdict({
+      anthropic, projectId: project_id, lemma: card.name, excerpt, languageName: languageName(projectConfig.ttsLocale),
+    })
+    return { ...card, senses, sense_check: { verdict, reasoning } }
+  }
+
+  async function executeSearchKnowledgeCards(query, excerpt) {
     const { data, error } = await supabase
       .from('knowledge_cards')
-      .select('id, name, kind, tags, importance')
+      .select('id, name, kind, tags, importance, details')
       .ilike('name', `%${query}%`)
       .eq('project_id', project_id)
       .limit(5)
-    return error ? [] : data
+    if (error || !data) return []
+    return Promise.all(data.map(card => attachSenseInfo(card, excerpt)))
   }
 
   async function executeTool(name, input) {
     if (name === 'search_sources') return executeSearchSources(input.original_text)
-    if (name === 'search_knowledge_cards') return executeSearchKnowledgeCards(input.query)
+    if (name === 'search_knowledge_cards') return executeSearchKnowledgeCards(input.query, input.excerpt)
     return []
   }
 

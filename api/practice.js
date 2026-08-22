@@ -3,9 +3,22 @@ import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
 import { generatePracticeItem, PracticeGenerationFailedError, DEFAULT_PRACTICE_MODEL, toRawToolInput } from '../lib/practiceGenerate.js'
 import { getPracticeRule, resolvePracticeRule, practiceableSkillTypes, MAX_EASIER_SENTENCE_ATTEMPTS } from '../lib/practiceRules.js'
+import { EXCLUDE_RECENT_DAYS, RETIRED_LEVEL } from '../lib/practiceSelection.js'
+import { hasSenseAxis, senseValues, axisValueKey, axisValueGloss, skillDbColumns, resolveSkillType } from '../lib/skillTypes.js'
+import { DEFAULT_CHECK_MODEL } from '../lib/mcClozeCheck.js'
+import { logMcClozeCheck } from '../lib/mcClozeCheckLog.js'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 const MODEL = process.env.PRACTICE_MODEL || DEFAULT_PRACTICE_MODEL
+const CHECK_MODEL = process.env.PRACTICE_CHECK_MODEL || DEFAULT_CHECK_MODEL
+
+// Returns the gloss for `skillType` if `card` has a sense axis and `skillType` is one of its
+// values' keys, else null (an ordinary card, or a skill type that isn't a sense of this card).
+function senseGlossFor(card, skillType) {
+  if (!hasSenseAxis(card)) return null
+  const v = senseValues(card).find(sv => axisValueKey(sv) === skillType)
+  return v ? axisValueGloss(v) : null
+}
 
 function shuffle(arr) {
   const a = [...arr]
@@ -23,17 +36,26 @@ function shuffle(arr) {
 async function pickSubstituteSkill(projectId) {
   const types = practiceableSkillTypes()
   if (types.length === 0) return null
-  // Retired (level = 10, plan.md §5) skills are never auto-selected, substitution included.
+  // Retired (level = 10, plan.md §5) and recently-correct skills are never auto-selected,
+  // substitution included — same rule lib/practiceSelection.js's quick-start weighted sample
+  // uses, so a substitution can't reintroduce a skill quick-start deliberately excluded. Filtered
+  // in SQL (not in memory after the fact) so the `.limit(200)` cap still samples from the full
+  // eligible pool rather than being applied before eligibility is known.
+  const cutoff = new Date(Date.now() - EXCLUDE_RECENT_DAYS * 24 * 60 * 60 * 1000).toISOString()
   const { data } = await supabase
     .from('skill')
-    .select('card_id, type, level, knowledge_cards!inner(id, name, kind, tags, details, project_id)')
+    .select('id, card_id, type, sense_type, level, knowledge_cards!inner(id, name, kind, tags, details, project_id)')
     .eq('knowledge_cards.project_id', projectId)
     .in('type', types)
-    .or('level.is.null,level.neq.10')
+    .or(`level.is.null,level.neq.${RETIRED_LEVEL}`)
+    .or(`last_correct.is.null,last_correct.lt.${cutoff}`)
     .limit(200)
   if (!data || data.length === 0) return null
   const row = data[Math.floor(Math.random() * data.length)]
-  return { card: row.knowledge_cards, skillType: row.type, level: row.level ?? 1 }
+  // resolveSkillType, not row.type directly — a sense skill's DB type is always literally 'meaning'
+  // (see lib/skillTypes.js), and `.in('type', types)` above matches those rows too since 'meaning'
+  // is itself a practiceable type; the external identity is its sense_type.
+  return { card: row.knowledge_cards, skillType: resolveSkillType(row), level: row.level ?? 1, skillId: row.id }
 }
 
 export default async function handler(req, res) {
@@ -67,16 +89,37 @@ export default async function handler(req, res) {
     throw e
   }
 
-  const [{ data: project }, { data: card, error: cardError }, { data: skillRow }] = await Promise.all([
+  const [{ data: project }, { data: card, error: cardError }] = await Promise.all([
     supabase.from('projects').select('tts_locale').eq('id', project_id).single(),
     supabase.from('knowledge_cards').select('id, name, kind, tags, details').eq('project_id', project_id).eq('id', card_id).single(),
-    supabase.from('skill').select('level').eq('card_id', card_id).eq('type', skill_type).maybeSingle(),
   ])
   if (cardError || !card) return res.status(404).json({ error: 'Card not found' })
+
+  // The requested skill_type's actual DB row (id, level) — its row is keyed by (type, sense_type),
+  // not skill_type directly, once `card` tells us whether skill_type is a sense of this card (see
+  // lib/skillTypes.js's skillDbColumns).
+  const { type: requestedDbType, sense_type: requestedDbSenseType } = skillDbColumns(card, skill_type)
+  const { data: skillRow } = await supabase
+    .from('skill')
+    .select('id, level')
+    .eq('card_id', card_id)
+    .eq('type', requestedDbType)
+    .eq('sense_type', requestedDbSenseType)
+    .maybeSingle()
 
   let effectiveCard = card
   let effectiveSkillType = skill_type
   let effectiveLevel = skillRow?.level ?? 1
+  let effectiveSkillId = skillRow?.id ?? null
+
+  // A sense skill's type (e.g. "financial") isn't a literal key in lib/practiceRules.js's
+  // SKILL_PROBLEM_TYPES — it's drilled exactly like an ordinary vocabulary `meaning` skill, just
+  // with its own gloss threaded into extraPrompt below so generation targets the right sense, not
+  // just any sense (plan.md — "Word Senses" §4 calls this "the single most likely thing to be
+  // missed"). ruleLookupType is only used to pick/resolve the problem type; effectiveSkillType stays
+  // the real dotted-path type everywhere else (DB writes, the response, Explain, etc).
+  const senseGloss = senseGlossFor(effectiveCard, effectiveSkillType)
+  const ruleLookupType = senseGloss != null ? 'meaning' : effectiveSkillType
 
   // Continuing an existing "Easier sentence" chain: reuse the EXACT problemType that chain
   // already committed to (from its first turn's response, round-tripped back by the client as
@@ -86,13 +129,14 @@ export default async function handler(req, res) {
   // turns for. Only trusted when it resolves; otherwise falls through to a fresh pick below and
   // the stale history is discarded (see effectiveHistory).
   let rule = rawHistory.length > 0 && typeof problem_type === 'string'
-    ? resolvePracticeRule(effectiveSkillType, problem_type, { cardName: effectiveCard.name })
+    ? resolvePracticeRule(ruleLookupType, problem_type, { cardName: effectiveCard.name, cardTags: effectiveCard.tags })
     : null
   const continuingHistory = rule != null
 
   if (!rule) {
-    rule = getPracticeRule(effectiveSkillType, effectiveLevel, { cardName: effectiveCard.name })
+    rule = getPracticeRule(ruleLookupType, effectiveLevel, { cardName: effectiveCard.name, cardTags: effectiveCard.tags })
   }
+  let substituted = false
   if (!rule) {
     // The requested skill_type has no problem type configured for its current level
     // (lib/practiceRules.js) — silently swap in a different, practiceable skill rather than
@@ -102,8 +146,17 @@ export default async function handler(req, res) {
     effectiveCard = substitute.card
     effectiveSkillType = substitute.skillType
     effectiveLevel = substitute.level
-    rule = getPracticeRule(effectiveSkillType, effectiveLevel, { cardName: effectiveCard.name })
+    effectiveSkillId = substitute.skillId
+    substituted = true
+    rule = getPracticeRule(effectiveSkillType, effectiveLevel, { cardName: effectiveCard.name, cardTags: effectiveCard.tags })
     if (!rule) return res.status(422).json({ error: 'No practiceable skill types configured for this project' })
+  }
+
+  // senseGloss was derived from the ORIGINALLY requested skill — never valid after a substitution
+  // swapped in a different skill entirely.
+  if (senseGloss != null && !substituted) {
+    const senseNote = `This word has multiple senses; drill specifically the sense glossed as "${senseGloss}" — do not test any other sense of this word.`
+    rule = { ...rule, extraPrompt: rule.extraPrompt ? `${rule.extraPrompt}\n\n${senseNote}` : senseNote }
   }
 
   const { questionType: mode, problemType, extraPrompt } = rule
@@ -114,18 +167,37 @@ export default async function handler(req, res) {
 
   // Sampled fresh (and shuffled) on every request, not just the fixed top-15-by-importance list —
   // otherwise every generated sentence in a session leans on the same handful of words. Vocabulary
-  // only — grammar/expression cards aren't standalone words to "weave into" a sentence.
-  const { data: seedPool } = await supabase.from('knowledge_cards').select('name').eq('project_id', project_id).eq('kind', 'vocabulary').neq('id', effectiveCard.id).limit(300)
-  const seedCardNames = shuffle(seedPool ?? []).slice(0, 15).map(c => c.name)
+  // only — grammar/expression cards aren't standalone words to "weave into" a sentence. A polysemous
+  // card's name alone doesn't say which sense is known, so it's only offered once at least one of
+  // its senses is well-known (plan.md — "Word Senses" §4: knowing "Bank" as a bench doesn't make the
+  // financial sense readable) — ordinary (non-sense) cards keep the prior unrestricted behavior.
+  const { data: seedPool } = await supabase
+    .from('knowledge_cards')
+    .select('name, details, skill(type, level)')
+    .eq('project_id', project_id).eq('kind', 'vocabulary').neq('id', effectiveCard.id).limit(300)
+  const eligibleSeeds = (seedPool ?? []).filter(c => !hasSenseAxis(c) || (c.skill ?? []).some(s => (s.level ?? 0) >= 5))
+  const seedCardNames = shuffle(eligibleSeeds).slice(0, 15).map(c => c.name)
 
   const promptContext = { ttsLocale: project?.tts_locale, card: effectiveCard, skillType: effectiveSkillType, problemType, extraPrompt, seedCardNames }
 
   let request = null
+  // Every mc_cloze answer-uniqueness check (lib/mcClozeCheck.js) generatePracticeItem runs — the
+  // initial attempt and, if it failed, the retry — gets logged here, pass or fail, via
+  // onCheck. Awaited alongside the outcome below so a failed generation still gets its check
+  // attempt(s) recorded, not just a successful one.
+  const checkLogs = []
   try {
     const item = await generatePracticeItem({
-      anthropic, model: MODEL, mode, promptContext, history: effectiveHistory,
+      anthropic, model: MODEL, checkModel: CHECK_MODEL, mode, promptContext, history: effectiveHistory,
       onRequest: r => { request = r },
+      onCheck: ({ item: checkedItem, verification }) => {
+        checkLogs.push(logMcClozeCheck({
+          skillId: effectiveSkillId, cardId: effectiveCard.id, skillType: effectiveSkillType,
+          model: CHECK_MODEL, item: checkedItem, verification,
+        }))
+      },
     })
+    await Promise.all(checkLogs)
     // card/skill_type reflect what was ACTUALLY generated for — may differ from the request's
     // card_id/skill_type when a silent substitution happened above. The client uses these, not
     // its own request values, for anything downstream of this item (result recording, Explain,
@@ -136,6 +208,7 @@ export default async function handler(req, res) {
     // problemType via resolvePracticeRule above, instead of re-rolling it.
     return res.status(200).json({ item, mode, request, card: effectiveCard, skill_type: effectiveSkillType, seed_card_names: seedCardNames, problem_type: problemType })
   } catch (e) {
+    await Promise.all(checkLogs)
     if (e instanceof PracticeGenerationFailedError) {
       return res.status(422).json({ error: e.message, detail: e.detail })
     }

@@ -136,8 +136,11 @@ export default function App() {
   // { card, type } pairs — practice is generated per-skill now, not per-card (see
   // lib/practiceRules.js and CLAUDE.md's "Skills" section); each skill's question type is decided
   // server-side by the rule registry, not chosen here.
-  function handleStartPractice(skills) {
-    setPracticeSession({ skills })
+  // meta: optional { capNotice } — plan.md §4's failure-cap message, only ever set by
+  // PracticeStart's quick-start (CardsPanel's "Practice" button, a manual selection, never trips
+  // the cap notice since it's not the auto-selection path the cap governs).
+  function handleStartPractice(skills, meta) {
+    setPracticeSession({ skills, ...meta })
     setMode('practice')
   }
 
@@ -291,6 +294,8 @@ export default function App() {
               onSelectTag={openPeekTag}
               onSelectSource={handleOpenSourceInLibrary}
               highlightSkillType={peek.highlightSkillType}
+              tagCatalog={tagCatalog}
+              onNewTags={refreshTagCatalog}
             />
           )}
           {peek?.type === 'tag' && (

@@ -21,6 +21,13 @@ drop table if exists source_table_cells;
 drop table if exists table_cells;
 drop table if exists tables;
 
+-- mc_cloze_check retired in favor of mc_cloze_check_failure below — the original shape logged
+-- every check attempt (pass and fail) with a per-option jsonb verdicts blob; it's replaced by a
+-- failures-only table with plain sentence/reason columns. This table never held real user data
+-- (audit trail only), so it's just dropped rather than migrated. Safe to leave in permanently: a
+-- no-op once it's gone from a given database.
+drop table if exists mc_cloze_check;
+
 -- ── CREATE ────────────────────────────────────────────────────────────────────
 
 create table if not exists projects (
@@ -134,6 +141,52 @@ create table if not exists practice_attempt (
   conversation jsonb            -- raw { request: {model,system,messages}, response } sent to/received from the LLM
 );
 
+-- One row per FAILED mc_cloze answer-uniqueness check (lib/mcClozeCheck.js) — a passing check
+-- writes nothing here, so every row is a genuine problem worth looking at (a failed attempt that
+-- lib/practiceGenerate.js then retried once, same as any other PracticeValidationError).
+-- `offending_sentences`/`reasons` are PARALLEL arrays, one entry per problem sentence: the answer's
+-- own sentence (if it was judged ungrammatical/nonsensical) and/or any distractor's sentence that
+-- was wrongly judged BOTH grammatical and sensible. Each `reasons` entry is the checker's own verbatim
+-- verdict text for that sentence — for the answer-failure case a real "what's wrong" explanation, for
+-- a bad-distractor entry just its pass confirmation (e.g. "Correct.", since the checker itself saw
+-- nothing wrong with it — that's exactly why it's flagged as too-fine-an-alternative rather than a
+-- broken sentence). `sentence`/`options`/`answer` are the generated item's own fields, kept for
+-- context. See lib/mcClozeCheck.js's verifyMcClozeItem() for the exact derivation.
+create table if not exists mc_cloze_check_failure (
+  id                   uuid primary key default gen_random_uuid(),
+  skill_id             uuid references skill(id) on delete cascade,  -- nullable: a substituted/never-assessed skill may not have a row yet
+  card_id              uuid not null references knowledge_cards(id) on delete cascade,
+  skill_type           text not null,
+  model                text,     -- the small/cheap model used to judge each sentence
+  sentence             text not null,   -- the cloze sentence with its "___" blank, as generated
+  options              jsonb not null,
+  answer               text not null,
+  offending_sentences  text[] not null,
+  reasons              text[] not null,
+  created_at           timestamptz not null default now()
+);
+
+
+-- Per-lemma cache of the sense-checker verdict (plan.md — "Word Senses" §1): "does this word have
+-- learner-relevant distinct senses at all" is a property of the language, not of any one encounter,
+-- so it's asked once per (project, lemma) and never again. Reset-friendly in spirit (a stochastic
+-- judgment, regenerable by asking again) but small/cheap enough to just live here rather than
+-- through the reset-friendly-tables ceremony. lemma_norm is the same case-folded/trimmed form used
+-- as the cache key, not necessarily the card's display name.
+create table if not exists sense_check_cache (
+  id          uuid primary key default gen_random_uuid(),
+  project_id  uuid not null references projects(id) on delete cascade,
+  lemma_norm  text not null,
+  verdict     text not null check (verdict in ('single', 'distinct', 'stretched')),
+  reasoning   text,
+  created_at  timestamptz not null default now(),
+  unique (project_id, lemma_norm)
+);
+
+create index if not exists idx_sense_check_cache_project_id on sense_check_cache(project_id);
+
+alter table sense_check_cache enable row level security;
+drop policy if exists "anon full access" on sense_check_cache;
 
 -- ── RLS ───────────────────────────────────────────────────────────────────────
 
@@ -146,6 +199,7 @@ alter table tags                   enable row level security;
 alter table user_settings          enable row level security;
 alter table skill                  enable row level security;
 alter table practice_attempt       enable row level security;
+alter table mc_cloze_check_failure enable row level security;
 -- system_prompt_history RLS is enabled after the table is created below
 
 -- Remove old open-access policies
@@ -158,6 +212,7 @@ drop policy if exists "anon full access" on tags;
 drop policy if exists "anon full access" on user_settings;
 drop policy if exists "anon full access" on skill;
 drop policy if exists "anon full access" on practice_attempt;
+drop policy if exists "anon full access" on mc_cloze_check_failure;
 -- system_prompt_history drop policy is applied after the table is created below
 
 -- All data access goes through /api/* serverless functions using the service role key,
@@ -196,6 +251,8 @@ create index if not exists idx_tags_project_id            on tags(project_id);
 create index if not exists idx_contexts_project_id        on contexts(project_id);
 create index if not exists idx_skill_card_id               on skill(card_id);
 create index if not exists idx_practice_attempt_skill_id      on practice_attempt(skill_id);
+create index if not exists idx_mc_cloze_check_failure_card_id  on mc_cloze_check_failure(card_id);
+create index if not exists idx_mc_cloze_check_failure_skill_id on mc_cloze_check_failure(skill_id);
 -- idx_skill_last_correct and idx_practice_attempt_encounter_id are created below, in RETROACTIVE
 -- COLUMN ADDITIONS — each must run after its column exists under its current name/shape, which on
 -- an existing DB it doesn't yet at this point in the script (last_practiced -> last_correct rename;
@@ -274,6 +331,60 @@ alter table source_knowledge drop constraint if exists source_knowledge_knowledg
 alter table source_knowledge add constraint source_knowledge_knowledge_card_id_fkey
   foreign key (knowledge_card_id) references knowledge_cards(id) on delete cascade;
 
+-- Which skill this particular encounter demonstrated — plan.md "Word Senses": the source link, not
+-- just the skill row, should be able to say which sense of a polysemous word was met here. Started
+-- out as a sense-specific `sense_type text` column; generalized to a proper FK to `skill(id)` instead,
+-- since a real reference works uniformly for a sense skill, an ordinary flat skill, or a paradigm
+-- cell alike, rather than only ever being meaningful for the one case a bespoke text column could
+-- name. Null whenever an encounter isn't tied to one specific skill (the common case).
+alter table source_knowledge drop column if exists sense_type;
+alter table source_knowledge add column if not exists skill_id uuid references skill(id) on delete set null;
+create index if not exists idx_source_knowledge_skill_id on source_knowledge(skill_id);
+
+-- A sense skill (plan.md — "Word Senses") deliberately KEEPS `type = 'meaning'` — it still groups
+-- with every ordinary meaning skill for filtering/gating/practice-rule purposes — and uses this
+-- column to record WHICH sense, instead of overloading `type` with the sense key. '' (not null) for
+-- every non-sense skill, so `unique (card_id, type, sense_type)` below can enforce the same "one row
+-- per (card, type)" invariant it always has (a nullable column wouldn't: Postgres treats every NULL
+-- as distinct, so a plain `unique(card_id, type, sense_type)` with real NULLs would silently stop
+-- deduplicating ordinary skills). `lib/skillTypes.js`'s `resolveSkillType()`/`skillDbColumns()` are
+-- the only place this translation between "one external skill_type string" and these two columns
+-- happens — every API consumer still addresses a skill by one string, exactly as before senses existed.
+alter table skill add column if not exists sense_type text not null default '';
+alter table skill drop constraint if exists skill_card_id_type_key;
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'skill_card_id_type_sense_type_key') then
+    alter table skill add constraint skill_card_id_type_sense_type_key unique (card_id, type, sense_type);
+  end if;
+end $$;
+
+-- Practice scheduling (plan.md — "Practice Scheduling"). Four caches recomputable from
+-- practice_attempt (lib/practiceScheduling.js's computeSchedule() is the one place that derives
+-- them) — the attempt log stays the source of truth, and scripts/recompute-schedule.js re-derives
+-- these from scratch if they ever drift.
+--   state: 'never' (no attempts) | 'learning' (has attempts, never yet reached 'stable') |
+--     'relearning' (failed since its last promotion to 'stable' — needs 2 consecutive correct to
+--     exit) | 'stable' (passing, on the expanding interval ladder) | 'retired' (level 10, never
+--     scheduled again). See lib/practiceScheduling.js for the exact transition rules.
+--   interval_days / due_at: the expanding-interval ladder (plan.md §2: 1/3/7/16/35 days).
+--   consecutive_correct: only meaningful while `state = 'relearning'` — counts toward the 2
+--     consecutive corrects needed to exit.
+-- stable_interval_days is NOT one of plan.md §6's four named columns — it was added because
+-- implementing §2's "rejoin the ladder at its previous rung minus one" literally requires
+-- remembering the rung a skill fell FROM when it entered relearning, and interval_days itself gets
+-- pinned to 1 for the whole relearning episode (so it can't double as that memory). Same
+-- recomputable-cache status as the other four.
+alter table skill add column if not exists state text not null default 'never'
+  check (state in ('never', 'learning', 'relearning', 'stable', 'retired'));
+alter table skill add column if not exists interval_days smallint;
+alter table skill add column if not exists due_at timestamptz;
+alter table skill add column if not exists consecutive_correct smallint not null default 0;
+alter table skill add column if not exists stable_interval_days smallint;
+
+create index if not exists idx_skill_state_due_at on skill(state, due_at);
+create index if not exists idx_skill_due_at on skill(due_at);
+
 
 -- ── FUNCTIONS ─────────────────────────────────────────────────────────────────
 
@@ -309,10 +420,165 @@ begin
     insert into skill (card_id, type, level, importance)
     select new_card.id, s->>'type', null, (s->>'importance')::smallint
     from jsonb_array_elements(skills) as s
-    on conflict (card_id, type) do nothing;
+    on conflict (card_id, type, sense_type) do nothing;
   end if;
 
   return to_jsonb(new_card);
+end;
+$$;
+
+-- Splits a monosemous card's flat `meaning` skill into a two-value sense axis (plan.md — "Word
+-- Senses": "Monosemous words get no axis" / migration). Preserves the meaning skill's id, and
+-- therefore its level/hand_set/last_correct/importance and every practice_attempt row referencing
+-- it (skill_id is unchanged) — `type` stays 'meaning' the whole time (every sense skill does — see
+-- the `skill.sense_type` column comment above); only `sense_type` is set, from '' to the existing
+-- sense's key. The new sense gets its own row, also `type = 'meaning'`, keyed by its own sense_type.
+--
+-- p_new_key/p_new_gloss/p_new_example are OPTIONAL (default null): clicking "add sense" on a
+-- monosemous card is often just naming the one sense that's already there, not a claim that a
+-- second, distinct sense exists yet (CardDetailPanel's "+ Add sense" — see AddSenseForm.jsx). When
+-- p_new_key is omitted this creates a one-value sense axis — a legitimate state, not a stepping
+-- stone that must immediately get a second value — and a later append_sense_value call is how a
+-- genuinely new sense gets added once one actually shows up. The chat save flow (api/save.js) always
+-- has a real second encounter driving it, so it always supplies p_new_key.
+create or replace function migrate_card_to_senses(
+  p_card_id uuid,
+  p_existing_key text,
+  p_existing_gloss text,
+  p_existing_example text default null,
+  p_new_key text default null,
+  p_new_gloss text default null,
+  p_new_example text default null,
+  p_new_importance smallint default null
+) returns jsonb language plpgsql as $$
+declare
+  updated_card knowledge_cards;
+  existing_axes jsonb;
+  existing_skill_id uuid;
+  new_skill_id uuid;
+  sense_values jsonb;
+begin
+  select details->'axes' into existing_axes from knowledge_cards where id = p_card_id;
+  if existing_axes is not null and jsonb_array_length(existing_axes) > 0 then
+    raise exception 'Card already has axes — use append_sense_value instead';
+  end if;
+  if p_new_key is not null and p_existing_key = p_new_key then
+    raise exception 'existing and new sense keys must differ';
+  end if;
+
+  sense_values := jsonb_build_array(jsonb_build_object('key', p_existing_key, 'gloss', p_existing_gloss, 'example', p_existing_example));
+  if p_new_key is not null then
+    sense_values := sense_values || jsonb_build_array(jsonb_build_object('key', p_new_key, 'gloss', p_new_gloss, 'example', p_new_example));
+  end if;
+
+  update knowledge_cards
+  set details = coalesce(details, '{}'::jsonb) || jsonb_build_object(
+    'axes', jsonb_build_array(jsonb_build_object('name', 'sense', 'values', sense_values))
+  )
+  where id = p_card_id
+  returning * into updated_card;
+
+  update skill set sense_type = p_existing_key where card_id = p_card_id and type = 'meaning' and sense_type = '';
+  select id into existing_skill_id from skill where card_id = p_card_id and type = 'meaning' and sense_type = p_existing_key;
+
+  if p_new_key is not null then
+    insert into skill (card_id, type, sense_type, level, importance)
+    values (p_card_id, 'meaning', p_new_key, null, p_new_importance)
+    on conflict (card_id, type, sense_type) do nothing;
+    select id into new_skill_id from skill where card_id = p_card_id and type = 'meaning' and sense_type = p_new_key;
+  end if;
+
+  -- Returns { card, skill_id, existing_skill_id }. skill_id is the newly touched sense's row (the
+  -- new one if a second sense was given, else the renamed existing one) — callers (api/save.js) use
+  -- it to point a source_knowledge link at the CURRENT encounter in the same request, no extra round
+  -- trip. existing_skill_id is always the renamed (pre-split) skill specifically — the card's OTHER,
+  -- already-linked sources predate any sense distinction and almost certainly belong to it, which is
+  -- what api/knowledge-cards.js's `link_existing_sources` option backfills them to.
+  return jsonb_build_object(
+    'card', to_jsonb(updated_card),
+    'skill_id', coalesce(new_skill_id, existing_skill_id),
+    'existing_skill_id', existing_skill_id
+  );
+end;
+$$;
+
+-- Appends one more value to a card that already has a sense axis — the one deliberate exception to
+-- axis immutability (plan.md: "Sense axes are append-only after save"). Creates the new sense's
+-- skill row eagerly: unlike an ordinary paradigm cell, a sense axis value existing at all IS an
+-- encounter (plan.md — "for sense axes specifically, an axis value existing IS an encounter").
+create or replace function append_sense_value(
+  p_card_id uuid,
+  p_key text,
+  p_gloss text,
+  p_example text,
+  p_importance smallint default null
+) returns jsonb language plpgsql as $$
+declare
+  updated_card knowledge_cards;
+  axes jsonb;
+  existing_values jsonb;
+  new_skill_id uuid;
+begin
+  select details->'axes' into axes from knowledge_cards where id = p_card_id;
+  if axes is null or jsonb_array_length(axes) = 0 or (axes->0->>'name') <> 'sense' then
+    raise exception 'Card has no sense axis to append to';
+  end if;
+  existing_values := axes->0->'values';
+  if exists (select 1 from jsonb_array_elements(existing_values) v where v->>'key' = p_key) then
+    raise exception 'Sense key "%" already exists on this card', p_key;
+  end if;
+
+  update knowledge_cards
+  set details = jsonb_set(
+    details, '{axes,0,values}',
+    existing_values || jsonb_build_array(jsonb_build_object('key', p_key, 'gloss', p_gloss, 'example', p_example))
+  )
+  where id = p_card_id
+  returning * into updated_card;
+
+  insert into skill (card_id, type, sense_type, level, importance)
+  values (p_card_id, 'meaning', p_key, null, p_importance)
+  on conflict (card_id, type, sense_type) do nothing;
+
+  select id into new_skill_id from skill where card_id = p_card_id and type = 'meaning' and sense_type = p_key;
+
+  -- Returns { card, skill_id } — see migrate_card_to_senses above for why.
+  return jsonb_build_object('card', to_jsonb(updated_card), 'skill_id', new_skill_id);
+end;
+$$;
+
+-- Corrects an existing sense's gloss in place — plan.md's "Refine existing sense" save-flow option:
+-- "the gloss is wrong; edit it. Do not force a fork when the right fix is a better gloss." Does NOT
+-- touch the value's `key` (which every skill row's `type` and every practice_attempt trace back to)
+-- or remove/reorder values — only the append-only-safe `gloss` field.
+create or replace function update_sense_gloss(
+  p_card_id uuid,
+  p_key text,
+  p_gloss text
+) returns jsonb language plpgsql as $$
+declare
+  updated_card knowledge_cards;
+  axes jsonb;
+  idx int;
+begin
+  select details->'axes' into axes from knowledge_cards where id = p_card_id;
+  if axes is null or jsonb_array_length(axes) = 0 or (axes->0->>'name') <> 'sense' then
+    raise exception 'Card has no sense axis';
+  end if;
+
+  select ord - 1 into idx
+  from jsonb_array_elements(axes->0->'values') with ordinality as t(v, ord)
+  where t.v->>'key' = p_key;
+  if idx is null then
+    raise exception 'Sense key "%" not found', p_key;
+  end if;
+
+  update knowledge_cards
+  set details = jsonb_set(details, array['axes', '0', 'values', idx::text, 'gloss'], to_jsonb(p_gloss))
+  where id = p_card_id
+  returning * into updated_card;
+
+  return to_jsonb(updated_card);
 end;
 $$;
 
@@ -388,13 +654,16 @@ begin
   where knowledge_card_id = any(p_card_ids) and knowledge_card_id <> primary_id
   on conflict (source_id, knowledge_card_id) do nothing;
 
-  -- skills: keep only the highest-level row per type across the whole set (delete the rest first,
-  -- so the unique(card_id, type) constraint can never see two rows of the same type at once), then
-  -- move every surviving row onto the primary card
+  -- skills: keep only the highest-level row per (type, sense_type) across the whole set (delete the
+  -- rest first, so the unique(card_id, type, sense_type) constraint can never see two rows of the
+  -- same (type, sense_type) at once), then move every surviving row onto the primary card. Paradigm
+  -- cards (details ? 'axes', which a sense-split card also has) are already blocked from reaching
+  -- this function at all (see paradigm_count check above) — partitioning by sense_type too is just
+  -- defense in depth in case that restriction is ever relaxed.
   with ranked as (
-    select id, type,
+    select id, type, sense_type,
            row_number() over (
-             partition by type
+             partition by type, sense_type
              order by level desc nulls last, created_at asc
            ) as rn
     from skill
@@ -416,6 +685,21 @@ begin
 end;
 $$;
 
+-- Practice scheduling (plan.md §2/§5): the most recent practice_attempt timestamp per skill,
+-- project-wide, in ONE round trip — this is what the selection algorithm's 15-minute
+-- within-session cooldown floor is computed against (lib/practiceSelection.js's isInCooldown()),
+-- since "last attempted" has to reflect EVERY outcome including 'too_hard' (which never touches
+-- skill.due_at — see plan.md §2), not just skill.last_correct (which only stamps on a win).
+create or replace function skill_last_attempt(p_project_id uuid)
+returns table (skill_id uuid, last_attempt_at timestamptz) language sql stable as $$
+  select pa.skill_id, max(pa.created_at)
+  from practice_attempt pa
+  join skill s on s.id = pa.skill_id
+  join knowledge_cards c on c.id = s.card_id
+  where c.project_id = p_project_id
+  group by pa.skill_id;
+$$;
+
 -- Skills page (plan.md) — shared derivation of a skill's "practice state" from practice_attempt,
 -- joined to its owning card. Set-returning, filtered only by project so browse_skills and
 -- skill_level_histogram below can each apply their own WHERE clause over the same derivation
@@ -430,6 +714,18 @@ $$;
 --   - else, most recent encounter's last round outcome = 'correct' -> 'passing', else 'failing'
 -- attempt_count/failed_count/too_hard_count are ACROSS ALL encounters (distinct encounter_id),
 -- not just the most recent one — that's what "failed N×" / "N× too hard" report on a row.
+--
+-- last_outcome is the raw outcome ('correct' | 'incorrect' | 'too_hard') of the most recent
+-- encounter's last round — null when never practiced. It's a simpler, non-outranked sibling of
+-- practice_state (which folds a too_hard encounter into its own bucket ahead of failing): this is
+-- literally "what happened last time", for the Skills page's right/wrong/never-tested indicator
+-- and its 'last_result' sort.
+--
+-- CASCADE: browse_skills/skill_level_histogram/browse_cards below all call this as a set-returning
+-- FROM-clause function, which Postgres records as a real dependency — changing this function's OUT
+-- row shape (adding last_outcome) requires dropping it, which drags those down with it. All three
+-- are unconditionally recreated later in this same file, so this is safe to reapply every migrate.
+drop function if exists skill_practice_state(uuid) cascade;
 create or replace function skill_practice_state(p_project_id uuid)
 returns table (
   skill_id          uuid,
@@ -450,7 +746,8 @@ returns table (
   attempt_count     int,
   failed_count      int,
   too_hard_count    int,
-  last_attempt_at   timestamptz
+  last_attempt_at   timestamptz,
+  last_outcome      text
 ) language sql stable as $$
   with encounters as (
     select
@@ -475,7 +772,12 @@ returns table (
     group by e.skill_id
   )
   select
-    s.id, s.type, s.level, s.importance, s.hand_set, s.last_correct, s.created_at,
+    -- A sense skill's DB `type` is always literally 'meaning' (see the skill.sense_type column
+    -- comment above) — every consumer of this function (browse_skills, skill_level_histogram,
+    -- browse_cards) expects the ONE resolved skill_type string every other read path uses
+    -- (lib/skillTypes.js's resolveSkillType()), so it's resolved once, here, rather than in every
+    -- caller.
+    s.id, coalesce(nullif(s.sense_type, ''), s.type) as type, s.level, s.importance, s.hand_set, s.last_correct, s.created_at,
     c.id, c.name, c.kind, c.tags, c.importance, c.details, c.created_at,
     case
       when sa.last_attempt_at is null then 'never_practiced'
@@ -486,7 +788,8 @@ returns table (
     coalesce(sa.encounter_count, 0),
     coalesce(sa.failed_count, 0),
     coalesce(sa.too_hard_count, 0),
-    sa.last_attempt_at
+    sa.last_attempt_at,
+    sa.last_final_outcome
   from skill s
   join knowledge_cards c on c.id = s.card_id
   left join skill_agg sa on sa.skill_id = s.id
@@ -499,10 +802,14 @@ $$;
 -- every tag given — AND semantics per plan.md §2). total_count is a window count over the filtered
 -- (pre-limit) set, so the client gets pagination totals in one round trip.
 --
--- Sort: 'level' | 'last_practiced' | 'attempt_count' | 'importance' | 'name' | 'created'.
--- Nulls sort last always; for 'level' specifically, never-practiced rows (attempt_count = 0) sort
--- last WITHIN their level group regardless of direction (plan.md §3) — they're the least
--- actionable row at that level, so mixing them in with earned levels defeats the audit.
+-- Sort: 'level' | 'last_practiced' | 'attempt_count' | 'importance' | 'name' | 'created' |
+-- 'last_result'. Nulls sort last always; for 'level' specifically, never-practiced rows
+-- (attempt_count = 0) sort last WITHIN their level group regardless of direction (plan.md §3) —
+-- they're the least actionable row at that level, so mixing them in with earned levels defeats
+-- the audit. 'last_result' ranks by last_outcome — wrong (incorrect/too_hard), then right
+-- (correct), then never-tested (null) ascending, reversed on descending — per the Skills page's
+-- right/wrong/never-tested indicator.
+drop function if exists browse_skills(uuid, text, smallint, smallint, text[], text, text[], text, text, text, int, int);
 create or replace function browse_skills(
   p_project_id  uuid,
   p_skill_type  text default null,
@@ -522,7 +829,7 @@ create or replace function browse_skills(
   card_id uuid, card_name text, card_kind text, card_tags text[], card_importance smallint,
   card_details jsonb, card_created_at timestamptz,
   practice_state text, attempt_count int, failed_count int, too_hard_count int,
-  last_attempt_at timestamptz, total_count bigint
+  last_attempt_at timestamptz, last_outcome text, total_count bigint
 ) language sql stable as $$
   select s.*, count(*) over()
   from skill_practice_state(p_project_id) s
@@ -548,6 +855,16 @@ create or replace function browse_skills(
     case when p_sort = 'name' and p_sort_dir = 'desc' then s.card_name end desc,
     case when p_sort = 'name' then s.card_name end asc,
     case when p_sort = 'created' then s.skill_created_at end desc,
+    case when p_sort = 'last_result' and p_sort_dir = 'asc' then
+      case when s.last_outcome in ('incorrect', 'too_hard') then 0
+           when s.last_outcome = 'correct' then 1
+           else 2 end
+    end asc,
+    case when p_sort = 'last_result' and p_sort_dir = 'desc' then
+      case when s.last_outcome in ('incorrect', 'too_hard') then 0
+           when s.last_outcome = 'correct' then 1
+           else 2 end
+    end desc,
     s.skill_id
   limit p_limit offset p_offset;
 $$;

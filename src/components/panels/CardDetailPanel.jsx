@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { apiFetch } from '../../apiFetch.js'
 import { speak } from '../../tts.js'
-import { SKILL_TYPES } from '../../../lib/skillTypes.js'
+import { SKILL_TYPES, axisValueKey, axisValueGloss, axisValueExample, isSenseAxis, hasSenseAxis } from '../../../lib/skillTypes.js'
+import AddSenseForm from '../AddSenseForm.jsx'
 
 function HighlightedText({ text, positions = [] }) {
   if (!positions.length) return <>{text}</>
@@ -32,17 +33,106 @@ function formatDate(iso) {
   })
 }
 
+// Coarse-to-fine relative time for the practice history list below — attempts within the same
+// session read as minutes/hours ago, older ones fall back to formatDate's absolute form via the
+// day/month/year rungs, same granularity SkillsPanel.jsx's daysAgo uses for the Skills page.
+function timeAgo(iso) {
+  const diffMs = Date.now() - new Date(iso).getTime()
+  const mins = Math.floor(diffMs / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days < 30) return `${days}d ago`
+  const months = Math.floor(days / 30)
+  if (months < 12) return `${months}mo ago`
+  return `${Math.floor(months / 12)}y ago`
+}
+
+const OUTCOME_STYLE = {
+  correct: { label: 'Correct', className: 'bg-green-100 text-green-700' },
+  incorrect: { label: 'Incorrect', className: 'bg-red-100 text-red-700' },
+  too_hard: { label: 'Too hard', className: 'bg-amber-100 text-amber-700' },
+}
+
+// One row per practice_attempt, most recent first (the order /api/skills?history_for= already
+// returns). The sentence actually used is collapsed by default — a click reveals it, same
+// disclosure pattern SkillsPanel.jsx's "Show prompt" toggle uses for the raw request.
+function PracticeHistoryRow({ attempt }) {
+  const [expanded, setExpanded] = useState(false)
+  const sentence = attempt.conversation?.response?.sentence ?? null
+  const style = OUTCOME_STYLE[attempt.outcome] ?? { label: attempt.outcome, className: 'bg-gray-100 text-gray-600' }
+  return (
+    <div className="text-xs">
+      <div className="flex items-center gap-1.5">
+        <span className={`text-[10px] font-medium rounded px-1.5 py-0.5 shrink-0 ${style.className}`}>{style.label}</span>
+        <span className="text-[10px] text-gray-400 shrink-0" title={formatDate(attempt.created_at)}>{timeAgo(attempt.created_at)}</span>
+        {sentence && (
+          <button
+            type="button"
+            onClick={() => setExpanded(v => !v)}
+            className="text-[10px] text-blue-500 hover:text-blue-700 font-medium ml-auto shrink-0"
+          >
+            {expanded ? 'Hide sentence' : 'Show sentence'}
+          </button>
+        )}
+      </div>
+      {expanded && sentence && (
+        <p className="text-[11px] text-gray-600 italic mt-1">{sentence}</p>
+      )}
+    </div>
+  )
+}
+
+// Fetches a skill's practice history (most recent first, via /api/skills?history_for=) whenever
+// `skillId` changes OR `refreshToken` changes identity — the latter is the card's own `detail`
+// object, which gets a fresh reference every time PracticePanel force-refetches it right after
+// recording a practice result, so a just-answered attempt shows up here without a manual refresh
+// even when it didn't move the skill's level (e.g. the first correct answer after a failure, which
+// deliberately leaves level unchanged — see lib/practiceScheduling.js's nextLevel).
+function PracticeHistory({ activeProject, skillId, refreshToken }) {
+  const [attempts, setAttempts] = useState(undefined)
+
+  useEffect(() => {
+    if (!skillId || !activeProject) { setAttempts(undefined); return }
+    let cancelled = false
+    setAttempts(undefined)
+    apiFetch(`/api/skills?${new URLSearchParams({ project_id: activeProject.id, history_for: skillId })}`)
+      .then(r => r.ok ? r.json() : [])
+      .then(data => { if (!cancelled) setAttempts(data) })
+      .catch(() => { if (!cancelled) setAttempts([]) })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.id, skillId, refreshToken])
+
+  if (attempts === undefined) return <p className="text-[10px] text-gray-400">Loading…</p>
+  if (attempts.length === 0) return <p className="text-[10px] text-gray-400">No practice yet.</p>
+  return (
+    <div className="space-y-2 divide-y divide-gray-100">
+      {attempts.map(attempt => (
+        <div key={attempt.id} className="pt-2 first:pt-0">
+          <PracticeHistoryRow attempt={attempt} />
+        </div>
+      ))}
+    </div>
+  )
+}
+
 const KIND_COLORS = {
   vocabulary: 'bg-green-100 text-green-700',
   grammar: 'bg-purple-100 text-purple-700',
   expression: 'bg-orange-100 text-orange-700',
 }
 
-// Cartesian product of { axis, values }[] -> array of partial { [axisName]: value } combos.
+// Cartesian product of { axis, values }[] -> array of partial { [axisName]: key } combos. `values`
+// entries may be plain strings (ordinary paradigm axes) or { key, gloss, example } objects (a sense
+// axis, see lib/skillTypes.js) — axisValueKey normalizes either shape to the string a type is built
+// from, so typeForCombo below never needs to know which shape it's looking at.
 function cartesian(axisList) {
   return axisList.reduce((acc, { axis, values }) => {
     const next = []
-    for (const combo of acc) for (const v of values ?? []) next.push({ ...combo, [axis]: v })
+    for (const combo of acc) for (const v of values ?? []) next.push({ ...combo, [axis]: axisValueKey(v) })
     return next
   }, [{}])
 }
@@ -190,38 +280,25 @@ function ParadigmSkillGrid({ axes, skillRows, onSetLevel, onSetImportance, savin
                   <tr>
                     <th className="p-1.5 bg-gray-50 border-b border-r border-gray-200 text-left font-medium text-gray-400">{rowAxis.name} \ {colAxis.name}</th>
                     {(colAxis.values ?? []).map(cv => (
-                      <th key={cv} className="p-1.5 bg-gray-50 border-b border-gray-200 font-medium text-gray-500">{cv}</th>
+                      <th key={axisValueKey(cv)} className="p-1.5 bg-gray-50 border-b border-gray-200 font-medium text-gray-500">{axisValueKey(cv)}</th>
                     ))}
                   </tr>
                 </thead>
               )}
               <tbody>
-                {(rowAxis.values ?? []).map(rv => (
-                  <tr key={rv}>
-                    <td className="p-1.5 bg-gray-50 border-r border-b border-gray-200 font-medium text-gray-500 whitespace-nowrap">{rv}</td>
-                    {colAxis ? (colAxis.values ?? []).map(cv => {
-                      const combo = { ...extra, [rowAxis.name]: rv, [colAxis.name]: cv }
-                      const type = typeForCombo(axes, combo)
-                      const cell = byType.get(type)
-                      return (
-                        <td key={cv} className="border-b border-gray-100 p-0.5">
-                          <button
-                            onClick={() => setSelectedType(type)}
-                            className={`w-full h-full min-h-[2rem] rounded border px-1.5 py-1 transition-colors ${skillColor(cell?.level)} ${
-                              selectedType === type ? 'ring-2 ring-blue-400' : 'hover:brightness-95'
-                            }`}
-                          >
-                            {cell ? (cell.level ?? '·') : ''}
-                          </button>
-                        </td>
-                      )
-                    }) : (
-                      <td className="border-b border-gray-100 p-0.5">
-                        {(() => {
-                          const combo = { ...extra, [rowAxis.name]: rv }
-                          const type = typeForCombo(axes, combo)
-                          const cell = byType.get(type)
-                          return (
+                {(rowAxis.values ?? []).map(rv => {
+                  const rvKey = axisValueKey(rv)
+                  const rvGloss = axisValueGloss(rv)
+                  return (
+                    <tr key={rvKey}>
+                      <td className="p-1.5 bg-gray-50 border-r border-b border-gray-200 font-medium text-gray-500 whitespace-nowrap" title={rvGloss ?? undefined}>{rvKey}</td>
+                      {colAxis ? (colAxis.values ?? []).map(cv => {
+                        const cvKey = axisValueKey(cv)
+                        const combo = { ...extra, [rowAxis.name]: rvKey, [colAxis.name]: cvKey }
+                        const type = typeForCombo(axes, combo)
+                        const cell = byType.get(type)
+                        return (
+                          <td key={cvKey} className="border-b border-gray-100 p-0.5">
                             <button
                               onClick={() => setSelectedType(type)}
                               className={`w-full h-full min-h-[2rem] rounded border px-1.5 py-1 transition-colors ${skillColor(cell?.level)} ${
@@ -230,12 +307,30 @@ function ParadigmSkillGrid({ axes, skillRows, onSetLevel, onSetImportance, savin
                             >
                               {cell ? (cell.level ?? '·') : ''}
                             </button>
-                          )
-                        })()}
-                      </td>
-                    )}
-                  </tr>
-                ))}
+                          </td>
+                        )
+                      }) : (
+                        <td className="border-b border-gray-100 p-0.5">
+                          {(() => {
+                            const combo = { ...extra, [rowAxis.name]: rvKey }
+                            const type = typeForCombo(axes, combo)
+                            const cell = byType.get(type)
+                            return (
+                              <button
+                                onClick={() => setSelectedType(type)}
+                                className={`w-full h-full min-h-[2rem] rounded border px-1.5 py-1 transition-colors ${skillColor(cell?.level)} ${
+                                  selectedType === type ? 'ring-2 ring-blue-400' : 'hover:brightness-95'
+                                }`}
+                              >
+                                {cell ? (cell.level ?? '·') : ''}
+                              </button>
+                            )
+                          })()}
+                        </td>
+                      )}
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -275,6 +370,97 @@ function ParadigmSkillGrid({ axes, skillRows, onSetLevel, onSetImportance, savin
   )
 }
 
+// A sense axis (lib/skillTypes.js) is one-dimensional and semantically nothing like a declension
+// grid — ParadigmSkillGrid's row×column table (built for genuinely multi-axis paradigms) hid the
+// gloss behind a click and rendered a mystery second column for it. Every sense gets its own row
+// here instead: key, gloss, example, and Level/Importance dots all visible without selecting a cell
+// first — there's no grid structure to justify hiding them.
+function SenseSkillList({ axes, skillRows, onSetLevel, onSetImportance, onRefineGloss, savingType, highlightType, levelChange }) {
+  const senseAxis = axes[0]
+  const byType = new Map(skillRows.map(s => [s.type, s]))
+  const [editingKey, setEditingKey] = useState(null)
+  const [glossDraft, setGlossDraft] = useState('')
+
+  return (
+    <div className="space-y-2">
+      {(senseAxis.values ?? []).map(v => {
+        const key = axisValueKey(v)
+        const gloss = axisValueGloss(v)
+        const example = axisValueExample(v)
+        const skill = byType.get(key)
+        const isEditing = editingKey === key
+        return (
+          <div key={key} className={`rounded-md border px-2 py-1.5 space-y-1.5 ${key === highlightType ? 'border-blue-300 bg-blue-50' : 'border-gray-200 bg-white'}`}>
+            <div>
+              <span className="text-xs font-semibold text-gray-700">{key}</span>
+              {isEditing ? (
+                <div className="flex items-start gap-1.5 mt-1">
+                  <textarea
+                    autoFocus
+                    rows={2}
+                    className="flex-1 text-xs border border-gray-200 rounded px-1.5 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400 resize-y"
+                    value={glossDraft}
+                    onChange={e => setGlossDraft(e.target.value)}
+                  />
+                  <div className="flex flex-col gap-1 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => { onRefineGloss(key, glossDraft); setEditingKey(null) }}
+                      disabled={!glossDraft.trim()}
+                      className="text-[10px] px-2 py-0.5 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-40"
+                    >
+                      Save
+                    </button>
+                    <button type="button" onClick={() => setEditingKey(null)} className="text-[10px] px-2 py-0.5 rounded border border-gray-200 text-gray-500 hover:bg-gray-50">
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-start gap-2">
+                  <p className="text-xs text-gray-600 italic flex-1">{gloss || '(no gloss yet)'}</p>
+                  {onRefineGloss && (
+                    <button
+                      type="button"
+                      onClick={() => { setGlossDraft(gloss ?? ''); setEditingKey(key) }}
+                      className="shrink-0 text-[10px] text-blue-500 hover:text-blue-700 font-medium"
+                    >
+                      Edit
+                    </button>
+                  )}
+                </div>
+              )}
+              {example && <p className="text-xs text-gray-400 mt-0.5">e.g. "{example}"</p>}
+            </div>
+            <div className="flex items-center gap-2">
+              <Dots
+                value={skill?.level ?? null}
+                disabled={savingType === key}
+                color="blue"
+                label="Level"
+                emptyLabel="not yet assessed"
+                onSet={value => onSetLevel(key, value)}
+              />
+              {key === levelChange?.type && <LevelDelta delta={levelChange.delta} />}
+            </div>
+            <div className="flex items-center gap-2">
+              <Dots
+                value={skill?.importance ?? null}
+                disabled={savingType === key}
+                color="amber"
+                label="Importance"
+                zeroable
+                emptyLabel="not set"
+                onSet={value => onSetImportance(key, value)}
+              />
+            </div>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 // `prefetchedDetail`, when given and matching `card.id`, is used in place of the panel's own
 // fetch — lets a caller (Practice's docked card panel) kick the request off earlier than mount,
 // so the panel renders with no loading flicker once shown. `levelChange` ({ type, delta } | null,
@@ -283,23 +469,32 @@ function ParadigmSkillGrid({ axes, skillRows, onSetLevel, onSetImportance, savin
 // "other vocabulary already known" pool offered to the model for the current item vs. what it
 // reports actually weaving in (lib/prompts/registry.js's seedSection, api/practice.js) — rendered
 // as a "Suggested vocabulary" section alongside the skill tested.
-export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRenamed, onAppendToChat, onDragStart, onSelectTag, onSelectSource, highlightSkillType, prefetchedDetail, levelChange, seedInfo }) {
+export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRenamed, onAppendToChat, onDragStart, onSelectTag, onSelectSource, highlightSkillType, prefetchedDetail, levelChange, seedInfo, tagCatalog = [], onNewTags }) {
   const [detail, setDetail] = useState(prefetchedDetail?.id === card?.id ? prefetchedDetail : null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
   const [savingImportance, setSavingImportance] = useState(false)
   const [savingSkillType, setSavingSkillType] = useState(null)
+  const [showAddSense, setShowAddSense] = useState(false)
+  const [editingSenseFor, setEditingSenseFor] = useState(null)
+  const [senseDraft, setSenseDraft] = useState('')
   const [confirmingDelete, setConfirmingDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [editingName, setEditingName] = useState(false)
   const [nameDraft, setNameDraft] = useState('')
   const [savingName, setSavingName] = useState(false)
   const [nameError, setNameError] = useState(null)
+  const [savingTags, setSavingTags] = useState(false)
+  const [showTagPicker, setShowTagPicker] = useState(false)
+  const [tagSearch, setTagSearch] = useState('')
 
   useEffect(() => {
     setConfirmingDelete(false)
     setEditingName(false)
     setNameError(null)
+    setShowTagPicker(false)
+    setTagSearch('')
+    setShowAddSense(false)
   }, [card?.id])
 
   useEffect(() => {
@@ -341,6 +536,75 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
     }
   }
 
+  const tags = detail?.tags ?? card?.tags ?? []
+
+  async function updateTags(newTags) {
+    if (!card || !activeProject) return
+    setSavingTags(true)
+    try {
+      const r = await apiFetch(`/api/knowledge-cards?project_id=${activeProject.id}&id=${card.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tags: newTags }),
+      })
+      if (!r.ok) throw new Error(r.statusText)
+      const updated = await r.json()
+      setDetail(prev => prev ? { ...prev, tags: updated.tags } : prev)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setSavingTags(false)
+    }
+  }
+
+  function removeTag(tag) {
+    updateTags(tags.filter(t => t !== tag))
+  }
+
+  function addTag(tag) {
+    setShowTagPicker(false)
+    setTagSearch('')
+    if (tags.includes(tag)) return
+    updateTags([...tags, tag])
+  }
+
+  async function addNewTag(name) {
+    const trimmed = name.trim()
+    setShowTagPicker(false)
+    setTagSearch('')
+    if (!trimmed || !activeProject || tags.includes(trimmed)) return
+    setSavingTags(true)
+    try {
+      const r = await apiFetch('/api/tags', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: activeProject.id, name: trimmed }),
+      })
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}))
+        throw new Error(body.error || r.statusText)
+      }
+      onNewTags?.()
+      await updateTags([...tags, trimmed])
+    } catch (e) {
+      setError(String(e.message || e))
+      setSavingTags(false)
+    }
+  }
+
+  const tagPickerOptions = tagCatalog
+    .filter(t => !tags.includes(t.name))
+    .filter(t => {
+      const q = tagSearch.trim().toLowerCase()
+      if (!q) return true
+      return t.name.toLowerCase().includes(q) || (t.display_name ?? '').toLowerCase().includes(q)
+    })
+    .sort((a, b) => a.name.localeCompare(b.name))
+  const trimmedTagQuery = tagSearch.trim()
+  const canAddNewTag = trimmedTagQuery.length > 0
+    && !tags.some(t => t.toLowerCase() === trimmedTagQuery.toLowerCase())
+    && !tagCatalog.some(t => t.name.toLowerCase() === trimmedTagQuery.toLowerCase())
+
   const rawAxes = detail?.details?.axes ?? card?.details?.axes
   const axes = Array.isArray(rawAxes) && rawAxes.length > 0 ? rawAxes : null
 
@@ -369,9 +633,77 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
   const updateSkillLevel = (skillType, value) => updateSkillField(skillType, 'level', value)
   const updateSkillImportance = (skillType, value) => updateSkillField(skillType, 'importance', value)
 
+  // "Refine existing sense" (plan.md — "Word Senses" §3), also reachable straight from the card
+  // detail view, not just at save time: correct a sense's gloss in place via the sense-specific
+  // PATCH shape (api/knowledge-cards.js) rather than the skill_type/level shape above, since a
+  // gloss lives on knowledge_cards.details.axes, not the skill row.
+  async function refineSenseGloss(senseKey, gloss) {
+    if (!card || !activeProject) return
+    setSavingSkillType(senseKey)
+    try {
+      const r = await apiFetch(`/api/knowledge-cards?project_id=${activeProject.id}&id=${card.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sense_key: senseKey, sense_gloss: gloss }),
+      })
+      if (!r.ok) throw new Error(r.statusText)
+      const updated = await r.json()
+      setDetail(prev => prev ? { ...prev, details: updated.details } : prev)
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setSavingSkillType(null)
+    }
+  }
+
+  // Full re-fetch after adding a sense — the PATCH response is just the updated card, but adding a
+  // sense also creates a new `skill` row this panel doesn't otherwise know about, so the simplest
+  // correct thing is to reload everything rather than hand-merge two partial shapes.
+  function refetchDetail() {
+    if (!card || !activeProject) return
+    apiFetch(`/api/knowledge-cards?project_id=${activeProject.id}&id=${card.id}`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
+      .then(setDetail)
+      .catch(e => setError(String(e)))
+  }
+
   const sources = detail?.source_knowledge
-    ?.map(sk => sk.sources ? { ...sk.sources, positions: sk.positions ?? [] } : null)
+    ?.map(sk => sk.sources ? { ...sk.sources, positions: sk.positions ?? [], skillId: sk.skill_id ?? null } : null)
     .filter(Boolean) ?? []
+
+  // This card's sense options for the per-source picker below (null when the card isn't sense-split
+  // — the picker only renders then). Each option pairs the sense's display key/gloss with its actual
+  // skill id, looked up from `detail.skill` (already resolved to the external sense key by the API —
+  // see lib/skillTypes.js's resolveSkillType()).
+  const senseOptions = axes && isSenseAxis(axes[0])
+    ? (axes[0].values ?? []).map(v => {
+        const key = axisValueKey(v)
+        return { key, gloss: axisValueGloss(v), skillId: (detail?.skill ?? []).find(s => s.type === key)?.id ?? null }
+      })
+    : null
+
+  async function updateSourceSense(source, newSkillId) {
+    if (!activeProject) return
+    const prevSkillId = source.skillId
+    setDetail(prev => prev ? {
+      ...prev,
+      source_knowledge: prev.source_knowledge.map(sk => sk.source_id === source.id ? { ...sk, skill_id: newSkillId } : sk),
+    } : prev)
+    try {
+      const r = await apiFetch('/api/source-knowledge', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project_id: activeProject.id, source_id: source.id, knowledge_card_id: card.id, skill_id: newSkillId }),
+      })
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText)
+    } catch (e) {
+      setError(String(e.message || e))
+      setDetail(prev => prev ? {
+        ...prev,
+        source_knowledge: prev.source_knowledge.map(sk => sk.source_id === source.id ? { ...sk, skill_id: prevSkillId } : sk),
+      } : prev)
+    }
+  }
 
   function startEditingName() {
     setNameDraft(card.name)
@@ -481,19 +813,85 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
               </span>
             </div>
 
-            {card.tags?.length > 0 && (
-              <div className="flex flex-wrap gap-1 mt-2">
-                {card.tags.map(tag => (
+            <div className="flex flex-wrap items-center gap-1 mt-2">
+              {tags.map(tag => (
+                <span key={tag} className="inline-flex items-center gap-1 text-[10px] bg-gray-100 text-gray-500 rounded px-1.5 py-0.5">
                   <button
-                    key={tag}
                     onClick={() => onSelectTag?.(tag)}
-                    className="text-[10px] bg-gray-100 text-gray-500 hover:bg-gray-200 rounded px-1.5 py-0.5 transition-colors"
+                    className="hover:text-gray-800 transition-colors"
                   >
                     {tag}
                   </button>
-                ))}
+                  <button
+                    onClick={() => removeTag(tag)}
+                    disabled={savingTags}
+                    title="Remove tag"
+                    className="leading-none text-gray-400 hover:text-red-500 disabled:cursor-wait"
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setShowTagPicker(v => !v)}
+                  disabled={savingTags}
+                  title="Add tag"
+                  className={`inline-flex items-center justify-center w-4 h-4 rounded-full text-[10px] font-medium border transition-colors disabled:cursor-wait ${showTagPicker ? 'bg-blue-100 border-blue-300 text-blue-600' : 'border-gray-300 text-gray-400 hover:text-blue-500 hover:border-blue-300'}`}
+                >
+                  +
+                </button>
+                {showTagPicker && (
+                  <>
+                    <button
+                      type="button"
+                      className="fixed inset-0 z-10 cursor-default"
+                      onClick={() => { setShowTagPicker(false); setTagSearch('') }}
+                      aria-label="Close tag picker"
+                    />
+                    <div className="absolute left-0 top-full mt-1 z-20 w-56 bg-white border border-gray-200 rounded-lg shadow-lg overflow-hidden">
+                      <input
+                        autoFocus
+                        className="w-full text-xs border-b border-gray-200 px-2 py-1.5 focus:outline-none"
+                        placeholder="Search tags…"
+                        value={tagSearch}
+                        onChange={e => setTagSearch(e.target.value)}
+                      />
+                      {canAddNewTag && (
+                        <button
+                          type="button"
+                          onClick={() => addNewTag(trimmedTagQuery)}
+                          className="w-full text-left px-2 py-1.5 hover:bg-amber-50 transition-colors border-b border-gray-100"
+                        >
+                          <span className="text-xs font-medium text-amber-700">+ Add new tag "{trimmedTagQuery}"</span>
+                        </button>
+                      )}
+                      <div className="max-h-40 overflow-y-auto">
+                        {tagPickerOptions.length === 0 && !canAddNewTag && (
+                          <p className="text-xs text-gray-400 text-center py-2">No matching tags</p>
+                        )}
+                        {tagPickerOptions.map(t => (
+                          <button
+                            key={t.id}
+                            type="button"
+                            onClick={() => addTag(t.name)}
+                            className="w-full text-left px-2 py-1.5 hover:bg-gray-50 transition-colors"
+                          >
+                            <div className="text-xs text-gray-800 truncate">
+                              {t.name}
+                              {t.display_name && (
+                                <span className="ml-1.5 text-[11px] text-gray-400">{t.display_name}</span>
+                              )}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
-            )}
+            </div>
 
             <div className="flex items-center gap-4 mt-3">
               <Dots value={importance} disabled={savingImportance} color="amber" label="Importance" zeroable emptyLabel="—" onSet={updateImportance} />
@@ -503,14 +901,52 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
           {/* Skill */}
           {detail && (
             <div>
-              <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-2">Skill</p>
-              {axes ? (
+              <div className="flex items-center justify-between mb-2">
+                <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Skill</p>
+                {card.kind === 'vocabulary' && !showAddSense && (
+                  <button
+                    type="button"
+                    onClick={() => setShowAddSense(true)}
+                    className="text-[10px] text-purple-500 hover:text-purple-700 font-medium"
+                  >
+                    + Add sense
+                  </button>
+                )}
+              </div>
+              {showAddSense && (
+                <div className="mb-3">
+                  <AddSenseForm
+                    card={card}
+                    hasSenseAxis={hasSenseAxis(detail ?? card)}
+                    unlinkedSourceCount={(detail.source_knowledge ?? []).filter(sk => !sk.skill_id).length}
+                    onAdded={() => { setShowAddSense(false); refetchDetail() }}
+                    onCancel={() => setShowAddSense(false)}
+                  />
+                </div>
+              )}
+              {axes && isSenseAxis(axes[0]) ? (
+                <SenseSkillList axes={axes} skillRows={detail.skill ?? []} onSetLevel={updateSkillLevel} onSetImportance={updateSkillImportance} onRefineGloss={refineSenseGloss} savingType={savingSkillType} highlightType={highlightSkillType} levelChange={levelChange} />
+              ) : axes ? (
                 <ParadigmSkillGrid axes={axes} skillRows={detail.skill ?? []} onSetLevel={updateSkillLevel} onSetImportance={updateSkillImportance} savingType={savingSkillType} highlightType={highlightSkillType} levelChange={levelChange} />
               ) : (
                 <FlatSkillList kind={card.kind} skillRows={detail.skill ?? []} onSetLevel={updateSkillLevel} onSetImportance={updateSkillImportance} savingType={savingSkillType} highlightType={highlightSkillType} levelChange={levelChange} />
               )}
             </div>
           )}
+
+          {/* Recent practice history for the just-practiced skill (Practice mode's docked card
+              panel always passes highlightSkillType; elsewhere — Library, the peek overlay — no
+              skill is "just answered" so this section stays hidden). */}
+          {detail && highlightSkillType && (() => {
+            const highlightedSkillId = (detail.skill ?? []).find(s => s.type === highlightSkillType)?.id ?? null
+            if (!highlightedSkillId) return null
+            return (
+              <div>
+                <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-2">Recent practice</p>
+                <PracticeHistory activeProject={activeProject} skillId={highlightedSkillId} refreshToken={detail} />
+              </div>
+            )
+          })()}
 
           {/* Seed vocabulary offered to the model for this practice item (Practice mode only) */}
           {seedInfo && seedInfo.offered.length > 0 && (
@@ -589,6 +1025,51 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
                       </span>
                     )}
                     <span className="text-[10px] text-gray-400">{formatDate(source.created_at)}</span>
+                    {senseOptions && (
+                      editingSenseFor === source.id ? (
+                        <div className="ml-auto flex items-center gap-1">
+                          <select
+                            autoFocus
+                            value={senseDraft}
+                            onChange={e => setSenseDraft(e.target.value)}
+                            title="Which sense of this word this source demonstrates"
+                            className="text-[10px] border border-gray-200 rounded px-1 py-0.5 bg-white text-gray-600 focus:outline-none focus:ring-1 focus:ring-purple-400"
+                          >
+                            <option value="">— no sense set —</option>
+                            {senseOptions.map(opt => (
+                              <option key={opt.key} value={opt.skillId ?? ''} disabled={!opt.skillId}>{opt.key}</option>
+                            ))}
+                          </select>
+                          <button
+                            type="button"
+                            onClick={() => { updateSourceSense(source, senseDraft || null); setEditingSenseFor(null) }}
+                            className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500 text-white hover:bg-purple-600"
+                          >
+                            Confirm
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditingSenseFor(null)}
+                            className="text-[10px] px-1.5 py-0.5 rounded border border-gray-200 text-gray-500 hover:bg-gray-50"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="ml-auto flex items-center gap-1.5">
+                          <span className="text-[10px] text-gray-500">
+                            {senseOptions.find(o => o.skillId === source.skillId)?.key ?? '— no sense —'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => { setEditingSenseFor(source.id); setSenseDraft(source.skillId ?? '') }}
+                            className="text-[10px] text-purple-500 hover:text-purple-700 font-medium"
+                          >
+                            Edit
+                          </button>
+                        </div>
+                      )
+                    )}
                   </div>
                 </div>
               ))}

@@ -294,6 +294,8 @@ export function LibraryMode({
             onDragStart={onDragStart}
             onSelectTag={handleSelectTag}
             onSelectSource={handleSelectSource}
+            tagCatalog={tagCatalog}
+            onNewTags={onNewTags}
           />
         )
       case 'skills':

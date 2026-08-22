@@ -9,6 +9,8 @@
     "migrate": "node scripts/migrate.js",
     "migrate:reset": "node scripts/migrate.js --reset",
     "backfill:skills": "node scripts/backfill-skills.js",
+    "recompute:schedule": "node scripts/recompute-schedule.js",
+    "prompt:run": "node scripts/prompt-run.js",
     "test:prompt:de": "node tests/german/prompt.test.js",
     "test:prompt:sv": "node tests/swedish/prompt.test.js",
     "test:practice:de": "node tests/german/practice.test.js",

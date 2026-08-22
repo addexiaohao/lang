@@ -94,8 +94,19 @@ function parseSaveBlocks(content) {
         const sourceRef = rawRecord.source_ref ?? null
         const existingId = rawRecord.existing_id ?? null
         const annotatedSentence = rawRecord.annotated_sentence ?? null
+        // Word-senses save flow (plan.md — "Word Senses" §3, lib/prompts/registry.js's "Word
+        // senses" section) — only ever set on a save:link_card block. Bundled as one object so
+        // LinkCard/SenseSelector can treat "no sense signal at all" as a single falsy check.
+        const senseProposal = (rawRecord.new_sense || rawRecord.existing_sense || rawRecord.sense_key || rawRecord.sense_flag)
+          ? {
+              newSense: rawRecord.new_sense ?? null,
+              existingSense: rawRecord.existing_sense ?? null,
+              senseKey: rawRecord.sense_key ?? null,
+              senseFlag: rawRecord.sense_flag ?? null,
+            }
+          : null
 
-        const metaKeys = new Set(['ref', 'source_ref', 'existing_id', 'new_tags', 'annotated_sentence'])
+        const metaKeys = new Set(['ref', 'source_ref', 'existing_id', 'new_tags', 'annotated_sentence', 'new_sense', 'existing_sense', 'sense_key', 'sense_flag'])
 
         const record = Object.fromEntries(Object.entries(rawRecord).filter(([k]) => !metaKeys.has(k)))
 
@@ -115,6 +126,7 @@ function parseSaveBlocks(content) {
           sourceRef,
           existingId,
           annotatedSentence,
+          senseProposal,
         })
       }
     } catch {
@@ -311,7 +323,7 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
     }
   }
 
-  async function handleLink(bi, existingCardId = null) {
+  async function handleLink(bi, existingCardId = null, senseFields = null) {
     const block = blocks.find(b => b.blockIndex === bi)
     const cardId = existingCardId ?? block.existingId
     const sourceId = block.sourceRef != null
@@ -320,7 +332,7 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
     if (!sourceId || !cardId) return
     setLinkStates(prev => prev.map((s, i) => i === bi ? { status: 'linking' } : s))
     try {
-      const linkRecord = { source_id: sourceId, knowledge_card_id: cardId }
+      const linkRecord = { source_id: sourceId, knowledge_card_id: cardId, ...(senseFields ?? {}) }
       const annotatedSentence = editedAnnotatedSentences[bi] ?? block.annotatedSentence
       if (annotatedSentence) linkRecord.annotated_sentence = annotatedSentence
       const res = await apiFetch('/api/save', {
@@ -385,7 +397,9 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
                   ref={el => { cardRefs.current[bi] = el }}
                   record={segment.record}
                   linkState={linkStates[bi] ?? { status: 'idle' }}
-                  onLink={() => handleLink(bi)}
+                  onLink={senseFields => handleLink(bi, null, senseFields)}
+                  existingId={segment.existingId}
+                  senseProposal={segment.senseProposal}
                   sourceId={sourceId}
                   annotatedSentence={editedAnnotatedSentences[bi] ?? segment.annotatedSentence}
                   onAnnotatedSentenceChange={value => updateAnnotatedSentence(bi, value)}
