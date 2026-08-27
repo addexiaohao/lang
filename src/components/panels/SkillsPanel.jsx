@@ -4,6 +4,7 @@ import { SKILL_TYPES } from '../../../lib/skillTypes.js'
 import { PRACTICE_STATES, PRACTICE_STATE_LABELS } from '../../../lib/practiceStates.js'
 import { levelToColor, importanceToColor } from '../../levelColor.js'
 import { MultiSelectPopover } from '../MultiSelectPopover.jsx'
+import GermanText from '../GermanText.jsx'
 
 // The Skills page (plan.md). One row per `skill`, not per card — see that file's "Why a separate
 // page" for the rationale. Rows/filters/sort/histogram are all served by schema.sql's
@@ -28,15 +29,6 @@ const SORT_OPTIONS = [
   { value: 'last_result', label: 'Last result' },
 ]
 
-// Marker colour + row-dimming per plan.md §1. never_practiced is deliberately NOT colour-coded —
-// an untested skill isn't a problem, just untouched; failures should draw the eye first.
-const STATE_MARKER = {
-  never_practiced: 'bg-gray-300',
-  failing: 'bg-red-500',
-  too_hard: 'bg-amber-500',
-  passing: 'bg-green-500',
-}
-
 function daysAgo(iso) {
   if (!iso) return null
   const days = Math.floor((Date.now() - new Date(iso).getTime()) / 86400000)
@@ -45,14 +37,63 @@ function daysAgo(iso) {
   return `${days}d ago`
 }
 
-function stateText(row) {
-  switch (row.practice_state) {
-    case 'never_practiced': return 'never practiced'
-    case 'failing': return `failed ${row.failed_count}× · last ${daysAgo(row.last_attempt_at)}`
-    case 'too_hard': return `${row.too_hard_count}× too hard`
-    case 'passing': return `last practiced ${daysAgo(row.last_attempt_at)}`
-    default: return ''
-  }
+// The scheduling state (lib/practiceScheduling.js — never/learning/relearning/stable/retired,
+// distinct from browse_skills's display-oriented `practice_state`, see CLAUDE.md's "Practice
+// scheduling"). 'relearning' gets a cross+checkmark glyph — proven once already, not yet
+// confirmed — rather than sharing 'learning''s plain glyph, since it's the one state that's
+// genuinely "in between" a wrong and a right answer.
+const SCHEDULE_STATE_DISPLAY = {
+  never: { label: 'New', glyph: '○', className: 'bg-gray-100 text-gray-400' },
+  learning: { label: 'Learning', glyph: '◐', className: 'bg-blue-50 text-blue-600' },
+  relearning: { label: 'Relearning', glyph: '✗✓', className: 'bg-amber-50 text-amber-700' },
+  stable: { label: 'Stable', glyph: '✓', className: 'bg-green-50 text-green-700' },
+  retired: { label: 'Retired', glyph: '■', className: 'bg-gray-100 text-gray-400' },
+}
+
+function StateBadge({ state }) {
+  const d = SCHEDULE_STATE_DISPLAY[state]
+  if (!d) return null
+  return (
+    <span
+      title={d.label}
+      className={`inline-flex items-center gap-1 text-[9px] font-medium rounded-full px-1.5 py-0.5 shrink-0 ${d.className}`}
+    >
+      <span aria-hidden="true">{d.glyph}</span>
+      {d.label}
+    </span>
+  )
+}
+
+const SCHEDULE_STATE_ORDER = ['never', 'learning', 'relearning', 'stable', 'retired']
+
+// Summary strip at the top of the panel — total skills in each schedule state, for whatever's
+// currently filtered (see the state_counts fetch effect above for exactly which filters apply —
+// deliberately NOT including scheduleState itself, so every badge's count stays visible no matter
+// which one is active). Clicking a badge sets/clears the schedule-state filter, same interaction as
+// clicking a histogram bar sets the level filter.
+function StateCountsStrip({ counts, activeState, onSetState }) {
+  const byState = new Map(counts.map(c => [c.state, c.count]))
+  return (
+    <div className="flex items-center gap-1.5 px-3 py-1.5 border-b bg-white shrink-0 flex-wrap">
+      {SCHEDULE_STATE_ORDER.map(state => {
+        const d = SCHEDULE_STATE_DISPLAY[state]
+        const active = activeState === state
+        const dim = activeState != null && !active
+        return (
+          <button
+            key={state}
+            onClick={() => onSetState(active ? null : state)}
+            title={d.label}
+            className={`inline-flex items-center gap-1 text-[10px] font-medium rounded-full pl-1.5 pr-2 py-0.5 transition-opacity ${d.className} ${active ? 'ring-2 ring-blue-400' : ''} ${dim ? 'opacity-40' : ''}`}
+          >
+            <span aria-hidden="true">{d.glyph}</span>
+            {d.label}
+            <span className="font-semibold tabular-nums">{byState.get(state) ?? 0}</span>
+          </button>
+        )
+      })}
+    </div>
+  )
 }
 
 // Ten-bar distribution above the list (plan.md §4). Respects every filter EXCEPT level (the
@@ -168,83 +209,157 @@ function ImportanceBadge({ importance }) {
   )
 }
 
-// Right/wrong/never-tested at a glance — a simpler sibling of the practice_state dot (which
-// outranks a too_hard encounter ahead of failing). This is just "what happened last time":
-// correct -> right, incorrect or too_hard -> wrong, null -> never tested. Same 3-way split the
-// 'last_result' sort orders by.
-function LastResultIcon({ lastOutcome }) {
-  if (lastOutcome == null) {
-    return <span title="Never tested" className="w-3.5 text-center text-[10px] text-gray-300 shrink-0">–</span>
-  }
-  if (lastOutcome === 'correct') {
-    return <span title="Correct last time" className="w-3.5 text-center text-[11px] font-bold text-green-600 shrink-0">✓</span>
-  }
+// The generated `item` shape differs by question type (see PracticeMcCloze/Spelling/Exemplar.jsx)
+// and practice_attempt rows don't carry their own mode column — infer it from the shape instead
+// of adding one, since the three are structurally distinct: mc_cloze alone has `options`,
+// exemplar alone has `target_span`, spelling is whatever's left (it has `meaning`, mc_cloze
+// doesn't).
+function inferItemMode(item) {
+  if (!item) return null
+  if (Array.isArray(item.options)) return 'mc_cloze'
+  if (item.target_span) return 'exemplar'
+  if (item.meaning !== undefined) return 'spelling'
+  return null
+}
+
+const OUTCOME_STYLE = {
+  correct: 'bg-green-100 text-green-700',
+  incorrect: 'bg-red-100 text-red-700',
+  too_hard: 'bg-amber-100 text-amber-700',
+}
+
+// A read-only reproduction of the actual practice UI for one attempt's generated item — same
+// blank-fill/highlight visual language as PracticeMcCloze/Spelling/Exemplar.jsx, just without
+// their interactivity (there's no "which option did the learner pick" to replay — the attempt log
+// only keeps the item and the outcome, not the learner's specific answer — so it renders in an
+// already-revealed state, coloured by whether the round as a whole was correct).
+function ReviewMcCloze({ item, outcome }) {
+  const [before, after] = item.sentence.split('___')
+  const correct = outcome === 'correct'
   return (
-    <span
-      title={lastOutcome === 'too_hard' ? 'Too hard last time' : 'Incorrect last time'}
-      className="w-3.5 text-center text-[11px] font-bold text-red-500 shrink-0"
-    >
-      ✗
-    </span>
+    <div className="space-y-3">
+      <p className="text-sm leading-relaxed text-gray-800">
+        <GermanText>{before}</GermanText>
+        <span className={`inline-block mx-1 px-2 py-0.5 rounded border-b-2 font-medium ${correct ? 'border-green-500 text-green-700 bg-green-50' : 'border-red-500 text-red-700 bg-red-50'}`}>
+          {item.answer}
+        </span>
+        <GermanText>{after}</GermanText>
+      </p>
+      <div className="space-y-1">
+        {item.options.map(opt => (
+          <div
+            key={opt}
+            className={`px-2 py-1 rounded border text-xs ${opt === item.answer ? 'border-green-500 bg-green-50 text-green-800' : 'border-gray-200 text-gray-400'}`}
+          >
+            {opt}
+          </div>
+        ))}
+      </div>
+      {item.translation && <p className="text-xs text-gray-500 italic">{item.translation}</p>}
+    </div>
   )
 }
 
-function formatDate(iso) {
-  return new Date(iso).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })
-}
-
-// One practice_attempt entry within the expanded history — same heading (outcome badge, date,
-// model) and response/prompt disclosure the single-attempt view used to show, just repeated once
-// per attempt now that the row expands to the full history rather than only the latest round.
-function AttemptRow({ attempt }) {
-  const [showPrompt, setShowPrompt] = useState(false)
-  const response = attempt.conversation?.response
+function ReviewSpelling({ item, outcome }) {
+  const [before, after] = item.sentence.split('___')
+  const correct = outcome === 'correct'
   return (
     <div className="space-y-2">
-      <div className="flex items-center gap-2">
-        <span className={`text-[10px] font-medium rounded px-1.5 py-0.5 ${
-          attempt.outcome === 'correct' ? 'bg-green-100 text-green-700'
-          : attempt.outcome === 'too_hard' ? 'bg-amber-100 text-amber-700'
-          : 'bg-red-100 text-red-700'
-        }`}>
+      <p className="text-sm leading-relaxed text-gray-800">
+        <GermanText>{before}</GermanText>
+        <span className={`inline-block mx-1 px-2 py-0.5 rounded border-b-2 font-medium ${correct ? 'border-green-500 text-green-700 bg-green-50' : 'border-red-500 text-red-700 bg-red-50'}`}>
+          {item.answer}
+        </span>
+        <GermanText>{after}</GermanText>
+      </p>
+      <p className="text-xs text-gray-500 italic">{item.meaning}</p>
+      {item.translation && <p className="text-xs text-gray-400 italic">{item.translation}</p>}
+    </div>
+  )
+}
+
+function ReviewExemplar({ item, outcome }) {
+  const positions = item.target_span ? [{ start: item.target_span[0], end: item.target_span[1] }] : []
+  const correct = outcome === 'correct'
+  return (
+    <div className="space-y-2">
+      <p className="text-sm leading-relaxed text-gray-800">
+        <GermanText
+          positions={positions}
+          highlightClassName={`bg-transparent underline decoration-2 font-semibold ${correct ? 'decoration-green-500' : 'decoration-red-500'}`}
+        >
+          {item.sentence}
+        </GermanText>
+      </p>
+      {item.translation && <p className="text-xs text-gray-500 italic">{item.translation}</p>}
+    </div>
+  )
+}
+
+// One practice_attempt row rendered as a collapsed tab (outcome + relative time only) that
+// expands in place to the question, shown the way it actually looked in practice rather than as
+// raw JSON.
+function AttemptTab({ attempt, expanded, onToggle }) {
+  const [showPrompt, setShowPrompt] = useState(false)
+  const item = attempt.conversation?.response
+  const mode = inferItemMode(item)
+  return (
+    <div className="border-b border-gray-100 last:border-b-0">
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-gray-50 transition-colors"
+      >
+        <span className={`text-[10px] font-medium rounded px-1.5 py-0.5 shrink-0 ${OUTCOME_STYLE[attempt.outcome] ?? 'bg-gray-100 text-gray-600'}`}>
           {attempt.outcome}
         </span>
-        <span className="text-[10px] text-gray-400">{formatDate(attempt.created_at)}</span>
-        {attempt.model && <span className="text-[10px] text-gray-300">· {attempt.model}</span>}
-      </div>
-      {response && (
-        <pre className="text-[10px] text-gray-700 bg-white border border-gray-200 rounded p-2 overflow-x-auto whitespace-pre-wrap">
-          {JSON.stringify(response, null, 2)}
-        </pre>
-      )}
-      <button
-        onClick={() => setShowPrompt(v => !v)}
-        className="text-[10px] text-blue-600 hover:text-blue-800 transition-colors"
-      >
-        {showPrompt ? 'Hide prompt' : 'Show prompt'}
+        <span className="text-[10px] text-gray-400">{daysAgo(attempt.created_at)}</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"
+          className={`w-2.5 h-2.5 text-gray-300 shrink-0 ml-auto transition-transform ${expanded ? 'rotate-90' : ''}`}>
+          <polyline points="9 18 15 12 9 6" />
+        </svg>
       </button>
-      {showPrompt && (
-        <pre className="text-[9px] text-gray-500 bg-white border border-gray-200 rounded p-2 overflow-x-auto max-h-64 whitespace-pre-wrap">
-          {JSON.stringify(attempt.conversation?.request ?? null, null, 2)}
-        </pre>
+      {expanded && (
+        <div className="px-3 py-2 bg-white border-t border-gray-100 space-y-2">
+          {mode === 'mc_cloze' && <ReviewMcCloze item={item} outcome={attempt.outcome} />}
+          {mode === 'spelling' && <ReviewSpelling item={item} outcome={attempt.outcome} />}
+          {mode === 'exemplar' && <ReviewExemplar item={item} outcome={attempt.outcome} />}
+          {!mode && <p className="text-[10px] text-gray-400">No question recorded.</p>}
+          {attempt.model && <p className="text-[10px] text-gray-300">{attempt.model}</p>}
+          <button
+            onClick={() => setShowPrompt(v => !v)}
+            className="text-[10px] text-blue-600 hover:text-blue-800 transition-colors"
+          >
+            {showPrompt ? 'Hide prompt' : 'Show prompt'}
+          </button>
+          {showPrompt && (
+            <pre className="text-[9px] text-gray-500 bg-gray-50 border border-gray-200 rounded p-2 overflow-x-auto max-h-64 whitespace-pre-wrap">
+              {JSON.stringify(attempt.conversation?.request ?? null, null, 2)}
+            </pre>
+          )}
+        </div>
       )}
     </div>
   )
 }
 
-// Row expansion (plan.md §6) — fetched lazily on first expand, cached per skill. `attempts` is
-// undefined while loading, or the full (possibly empty) list of practice_attempt rows, most
-// recent first.
+// Row expansion — fetched lazily on first expand, cached per skill. `attempts` is undefined while
+// loading, or the full (possibly empty) list of practice_attempt rows, most recent first —
+// rendered as a vertical list of tabs, each just outcome + how long ago; clicking one expands it
+// to the question, in place.
 function ExpandedRow({ attempts }) {
+  const [openAttemptId, setOpenAttemptId] = useState(null)
   if (attempts === undefined) return <p className="text-[10px] text-gray-400 py-2 px-3">Loading…</p>
   if (attempts.length === 0) return <p className="text-[10px] text-gray-400 py-2 px-3">No attempts yet.</p>
 
   return (
-    <div className="px-3 py-2 space-y-3 bg-gray-50/60 border-t border-gray-100 divide-y divide-gray-100">
+    <div className="bg-gray-50/60 border-t border-gray-100">
       {attempts.map(attempt => (
-        <div key={attempt.id} className="pt-3 first:pt-0">
-          <AttemptRow attempt={attempt} />
-        </div>
+        <AttemptTab
+          key={attempt.id}
+          attempt={attempt}
+          expanded={openAttemptId === attempt.id}
+          onToggle={() => setOpenAttemptId(prev => prev === attempt.id ? null : attempt.id)}
+        />
       ))}
     </div>
   )
@@ -266,15 +381,18 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
   const [states, setStates] = useState(() => new Set())
   const [tagsSelected, setTagsSelected] = useState(() => new Set())
   const [levelFilter, setLevelFilter] = useState(null)
+  const [scheduleStateFilter, setScheduleStateFilter] = useState(null)
   const [sort, setSort] = useState('level')
   const [sortDir, setSortDir] = useState('asc')
 
   const [histogram, setHistogram] = useState([])
+  const [stateCounts, setStateCounts] = useState([])
   const [expandedId, setExpandedId] = useState(null)
   const [attemptCache, setAttemptCache] = useState(() => new Map())
   const [savingId, setSavingId] = useState(null)
   const listRequestId = useRef(0)
   const histogramRequestId = useRef(0)
+  const stateCountsRequestId = useRef(0)
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 300)
@@ -301,6 +419,7 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
     setError(null)
     const params = filterParams()
     if (levelFilter != null) { params.set('level_min', levelFilter); params.set('level_max', levelFilter) }
+    if (scheduleStateFilter) params.set('schedule_state', scheduleStateFilter)
     params.set('sort', sort)
     params.set('sort_dir', sortDir)
     params.set('limit', PAGE_SIZE)
@@ -315,20 +434,39 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
       .catch(e => { if (requestId === listRequestId.current) setError(String(e)) })
       .finally(() => { if (requestId === listRequestId.current) setLoading(false) })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeProject?.id, debouncedSearch, kind, skillType, [...states].join(','), [...tagsSelected].join(','), levelFilter, sort, sortDir, refreshKey])
+  }, [activeProject?.id, debouncedSearch, kind, skillType, [...states].join(','), [...tagsSelected].join(','), levelFilter, scheduleStateFilter, sort, sortDir, refreshKey])
 
-  // Histogram — same filters minus level (plan.md §4). Same stale-response guard as the list fetch.
+  // Histogram — same filters minus level (plan.md §4), but schedule state still applies (that's
+  // not this function's own axis). Same stale-response guard as the list fetch.
   useEffect(() => {
     if (!activeProject) return
     const requestId = ++histogramRequestId.current
     const params = filterParams()
+    if (scheduleStateFilter) params.set('schedule_state', scheduleStateFilter)
     params.set('histogram', '1')
     apiFetch(`/api/skills?${params}`)
       .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
       .then(({ histogram }) => { if (requestId === histogramRequestId.current) setHistogram(histogram) })
       .catch(() => {})
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeProject?.id, debouncedSearch, kind, skillType, [...states].join(','), [...tagsSelected].join(','), refreshKey])
+  }, [activeProject?.id, debouncedSearch, kind, skillType, [...states].join(','), [...tagsSelected].join(','), scheduleStateFilter, refreshKey])
+
+  // Schedule-state summary strip — the SAME full filter set as the list itself (level included,
+  // unlike the histogram above), MINUS schedule state itself, since this is what generates the
+  // very badges that set that filter — every badge's count must stay visible no matter which one
+  // is currently active, or clicking one would zero out the others.
+  useEffect(() => {
+    if (!activeProject) return
+    const requestId = ++stateCountsRequestId.current
+    const params = filterParams()
+    if (levelFilter != null) { params.set('level_min', levelFilter); params.set('level_max', levelFilter) }
+    params.set('state_counts', '1')
+    apiFetch(`/api/skills?${params}`)
+      .then(r => r.ok ? r.json() : Promise.reject(r.statusText))
+      .then(({ counts }) => { if (requestId === stateCountsRequestId.current) setStateCounts(counts) })
+      .catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.id, debouncedSearch, kind, skillType, [...states].join(','), [...tagsSelected].join(','), levelFilter, refreshKey])
 
   const hasMore = items.length < total
 
@@ -338,6 +476,7 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
     const requestId = listRequestId.current
     const params = filterParams()
     if (levelFilter != null) { params.set('level_min', levelFilter); params.set('level_max', levelFilter) }
+    if (scheduleStateFilter) params.set('schedule_state', scheduleStateFilter)
     params.set('sort', sort)
     params.set('sort_dir', sortDir)
     params.set('limit', PAGE_SIZE)
@@ -427,6 +566,7 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
   const activeFilterChips = [
     skillType && { key: 'type', label: `Skill: ${skillType}`, clear: () => setSkillType('') },
     levelFilter != null && { key: 'level', label: `Level: ${levelFilter}`, clear: () => setLevelFilter(null) },
+    scheduleStateFilter && { key: 'schedule', label: SCHEDULE_STATE_DISPLAY[scheduleStateFilter].label, clear: () => setScheduleStateFilter(null) },
     ...[...states].map(s => ({ key: `state-${s}`, label: PRACTICE_STATE_LABELS[s], clear: () => toggleState(s) })),
     ...[...tagsSelected].map(t => ({ key: `tag-${t}`, label: `#${t}`, clear: () => toggleTag(t) })),
   ].filter(Boolean)
@@ -459,6 +599,7 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
         </div>
       </div>
 
+      <StateCountsStrip counts={stateCounts} activeState={scheduleStateFilter} onSetState={setScheduleStateFilter} />
       <Histogram data={histogram} activeLevel={levelFilter} onSetLevel={setLevelFilter} />
 
       <div className="px-2 py-1.5 border-b bg-white shrink-0 space-y-1.5">
@@ -568,7 +709,7 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
                 onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleExpand(row) } }}
                 className={`w-full flex items-center gap-2 pl-2 pr-3 py-2 text-left hover:bg-gray-50 transition-colors cursor-pointer ${dimmed ? 'opacity-60' : ''}`}
               >
-                <span className={`w-2 h-2 rounded-full shrink-0 ${STATE_MARKER[row.practice_state]}`} title={row.practice_state} />
+                <StateBadge state={row.schedule_state} />
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-1.5">
                     <ImportanceBadge importance={row.card.importance} />
@@ -576,20 +717,26 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
                       onClick={e => { e.stopPropagation(); onSelectCard?.(row.card) }}
                       className="text-xs font-medium text-gray-800 hover:text-blue-600 truncate transition-colors"
                     >
-                      {row.card.name}
+                      <GermanText>{row.card.name}</GermanText>
                     </button>
                     <span className={`text-[9px] rounded px-1 py-0.5 font-medium shrink-0 ${KIND_COLORS[row.card.kind] ?? 'bg-gray-100 text-gray-600'}`}>
                       {row.card.kind}
                     </span>
+                    {row.card_group_count > 0 && (
+                      <span
+                        title={`This card is in ${row.card_group_count} group${row.card_group_count > 1 ? 's' : ''} — a level here can reflect interference, not just isolation`}
+                        className="flex items-center shrink-0 text-purple-400"
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-2.5 h-2.5">
+                          <circle cx="8" cy="8" r="4" /><circle cx="16" cy="16" r="4" /><path d="M11 11l2 2" />
+                        </svg>
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-1.5 mt-0.5">
                     <span className="text-[10px] text-gray-500 truncate">{row.type}</span>
-                    <span className="text-[10px] text-gray-300">·</span>
-                    <span className="text-[10px] text-gray-400 truncate">{stateText(row)}</span>
                   </div>
                 </div>
-                {row.level === 10 && <span className="text-[9px] text-gray-400 shrink-0" title="Retired — never auto-selected by practice">retired</span>}
-                <LastResultIcon lastOutcome={row.last_outcome} />
                 <LevelMarker row={row} onSet={v => setLevel(row, v)} saving={savingId === row.id} />
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"
                   className={`w-2.5 h-2.5 text-gray-300 shrink-0 transition-transform ${expanded ? 'rotate-90' : ''}`}>

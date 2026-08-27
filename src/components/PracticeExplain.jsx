@@ -3,7 +3,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { apiFetch } from '../apiFetch.js'
 
-// Docked side panel (not a modal) for Practice mode's "Why?"/"Explain" button, rendered as a
+// Docked side panel (not a modal) for Practice mode's "Ask" button, rendered as a
 // sibling column inside PracticePanel.jsx. Supports multi-round follow-up: `messages` accumulates
 // the whole conversation and the full array is resent to /api/practice-explain every turn (same
 // stateless-server/stateful-client pattern ChatPanel.jsx uses for /api/chat). `suggestion` seeds
@@ -85,7 +85,7 @@ export default function PracticeExplain({ activeProject, suggestion, context, on
   return (
     <div className="w-80 sm:w-96 shrink-0 border-l bg-white flex flex-col h-full min-w-0">
       <div className="px-3 py-2 border-b flex items-center justify-between shrink-0">
-        <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Why?</span>
+        <span className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Ask</span>
         <button
           onClick={onClose}
           aria-label="Close"

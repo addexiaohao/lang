@@ -3,10 +3,11 @@ import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
 import { compose } from '../lib/prompts/registry.js'
 import { CHAT_MODEL } from '../lib/chatLoop.js'
+import { logLlmApiCall } from '../lib/llmUsageLog.js'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
-// Backs the Practice mode "Why?"/"Explain" button. Deliberately separate from api/chat.js:
+// Backs the Practice mode "Ask" button. Deliberately separate from api/chat.js:
 // a plain teacher-persona system prompt (practice.explain), no dedup tools, no save-block
 // instructions — so the frontend never needs to parse the response for save blocks, it's
 // just prose. Stateless like api/chat.js: the client (PracticeExplain.jsx) keeps the running
@@ -45,6 +46,7 @@ export default async function handler(req, res) {
   res.setHeader('Cache-Control', 'no-cache')
   res.setHeader('X-Accel-Buffering', 'no')
 
+  const startedAt = Date.now()
   const stream = anthropic.messages.stream({
     model: CHAT_MODEL,
     max_tokens: 1024,
@@ -52,10 +54,23 @@ export default async function handler(req, res) {
     messages,
   })
 
-  for await (const event of stream) {
-    if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-      res.write(event.delta.text)
+  try {
+    for await (const event of stream) {
+      if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+        res.write(event.delta.text)
+      }
     }
+    const message = await stream.finalMessage()
+    await logLlmApiCall({
+      projectId: project_id, userId: user.id, purpose: 'practice_explain', model: CHAT_MODEL,
+      usage: message.usage, stopReason: message.stop_reason, latencyMs: Date.now() - startedAt,
+    })
+  } catch (e) {
+    await logLlmApiCall({
+      projectId: project_id, userId: user.id, purpose: 'practice_explain', model: CHAT_MODEL,
+      status: 'error', errorMessage: e.message, latencyMs: Date.now() - startedAt,
+    })
+    throw e
   }
 
   res.end()

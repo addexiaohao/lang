@@ -1,9 +1,16 @@
 import { useState, useEffect } from 'react'
 import GermanText from './GermanText.jsx'
+import SpeakerButton from './SpeakerButton.jsx'
+import AddNoteButton from './AddNoteButton.jsx'
+import { speak } from '../tts.js'
+import { useProject } from '../ProjectContext.jsx'
+import { getProjectConfig } from '../../lib/projectConfig.js'
 
 // MC cloze exercise body. `item` is a practice.mc_cloze response: { sentence, options, answer, translation, option_meanings? }.
 // option_meanings (one English gloss per option, vocabulary cards only) is revealed exactly when the translation is.
-export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain, onAddSource, addSourceDisabled, onEasierSentence, easierCount = 0, maxEasierAttempts = 0 }) {
+export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain, onAddSource, addSourceDisabled, onEasierSentence, easierCount = 0, maxEasierAttempts = 0, onAddNote }) {
+  const { activeProject } = useProject()
+  const { ttsLocale } = getProjectConfig(activeProject ?? {})
   const [selected, setSelected] = useState(null)
   const [dontKnow, setDontKnow] = useState(false)
   const [showTranslation, setShowTranslation] = useState(false)
@@ -31,12 +38,14 @@ export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain,
         <p className="text-base leading-relaxed text-gray-800">
           <GermanText>{before}</GermanText>
           <span
+            onClick={() => { if (revealed && !dontKnow) speak(selected, ttsLocale) }}
+            title={revealed && !dontKnow ? `Speak: "${selected}"` : undefined}
             className={`inline-block mx-1 px-2 py-0.5 rounded border-b-2 font-medium ${
               !revealed
                 ? 'border-gray-300 text-gray-400'
                 : correct
-                  ? 'border-green-500 text-green-700 bg-green-50'
-                  : 'border-red-500 text-red-700 bg-red-50'
+                  ? 'border-green-500 text-green-700 bg-green-50 cursor-pointer'
+                  : 'border-red-500 text-red-700 bg-red-50 cursor-pointer'
             }`}
           >
             {revealed ? (dontKnow ? '?' : selected) : '_____'}
@@ -53,17 +62,19 @@ export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain,
             else if (revealed && isChosen) cls = 'border-red-500 bg-red-50 text-red-800'
             else if (revealed) cls = 'border-gray-200 opacity-50'
             return (
-              <button
-                key={opt}
-                onClick={() => choose(opt)}
-                disabled={revealed}
-                className={`w-full text-left px-3 py-2 rounded-lg border text-sm transition-colors ${cls}`}
-              >
-                {opt}
-                {showTranslation && item.option_meanings && (
-                  <span className="block text-xs font-normal text-gray-400 mt-0.5">{item.option_meanings[i]}</span>
-                )}
-              </button>
+              <div key={opt} className="flex items-center gap-1.5">
+                <button
+                  onClick={() => choose(opt)}
+                  disabled={revealed}
+                  className={`flex-1 min-w-0 text-left px-3 py-2 rounded-lg border text-sm transition-colors ${cls}`}
+                >
+                  {opt}
+                  {showTranslation && item.option_meanings && (
+                    <span className="block text-xs font-normal text-gray-400 mt-0.5">{item.option_meanings[i]}</span>
+                  )}
+                </button>
+                <SpeakerButton text={opt} lang={ttsLocale} />
+              </div>
             )
           })}
         </div>
@@ -78,8 +89,9 @@ export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain,
         )}
 
         {revealed && selected !== item.answer && (
-          <p className="mt-3 text-xs text-gray-500">
+          <p className="mt-3 text-xs text-gray-500 flex items-center gap-1">
             Correct answer: <span className="font-medium text-gray-700">{item.answer}</span>
+            <SpeakerButton text={item.answer} lang={ttsLocale} />
           </p>
         )}
 
@@ -95,7 +107,7 @@ export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain,
             disabled={!revealed}
             className="text-xs text-gray-400 hover:text-gray-600 disabled:opacity-0 transition-opacity"
           >
-            Why?
+            Ask
           </button>
           <button
             onClick={() => setShowTranslation(v => !v)}
@@ -119,6 +131,7 @@ export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain,
               Easier sentence
             </button>
           )}
+          {onAddNote && <AddNoteButton onSave={onAddNote} />}
         </div>
         <button
           onClick={onWeiter}

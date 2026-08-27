@@ -2,11 +2,12 @@ import Anthropic from '@anthropic-ai/sdk'
 import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
 import { generatePracticeItem, PracticeGenerationFailedError, DEFAULT_PRACTICE_MODEL, toRawToolInput } from '../lib/practiceGenerate.js'
-import { getPracticeRule, resolvePracticeRule, practiceableSkillTypes, MAX_EASIER_SENTENCE_ATTEMPTS } from '../lib/practiceRules.js'
+import { getPracticeRule, resolvePracticeRule, practiceableSkillTypes, buildDiscriminationRule, MAX_EASIER_SENTENCE_ATTEMPTS } from '../lib/practiceRules.js'
 import { EXCLUDE_RECENT_DAYS, RETIRED_LEVEL } from '../lib/practiceSelection.js'
 import { hasSenseAxis, senseValues, axisValueKey, axisValueGloss, skillDbColumns, resolveSkillType } from '../lib/skillTypes.js'
 import { DEFAULT_CHECK_MODEL } from '../lib/mcClozeCheck.js'
 import { logMcClozeCheck } from '../lib/mcClozeCheckLog.js'
+import { logLlmApiCall } from '../lib/llmUsageLog.js'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 const MODEL = process.env.PRACTICE_MODEL || DEFAULT_PRACTICE_MODEL
@@ -56,6 +57,39 @@ async function pickSubstituteSkill(projectId) {
   // (see lib/skillTypes.js), and `.in('type', types)` above matches those rows too since 'meaning'
   // is itself a practiceable type; the external identity is its sense_type.
   return { card: row.knowledge_cards, skillType: resolveSkillType(row), level: row.level ?? 1, skillId: row.id }
+}
+
+// Card Groups (plan.md) — picks one of this card's groups at random, among those with at least one
+// OTHER member, for a discrimination cloze (see lib/practiceRules.js's buildDiscriminationRule).
+// Two round trips rather than one nested query: membership rows for this card, then every member
+// row across those groups in one batched IN query — fine at this app's personal scale (same
+// N-queries-are-fine spirit as lib/mcClozeCheck.js's per-option checks).
+async function pickDiscriminationGroup(cardId) {
+  const { data: memberships } = await supabase
+    .from('card_group_member')
+    .select('group_id, card_group(note)')
+    .eq('card_id', cardId)
+  if (!memberships || memberships.length === 0) return null
+  const groupIds = memberships.map(m => m.group_id)
+  const { data: allMembers } = await supabase
+    .from('card_group_member')
+    .select('group_id, card_id, note, knowledge_cards(name)')
+    .in('group_id', groupIds)
+  const byGroup = new Map()
+  for (const row of allMembers ?? []) {
+    if (!byGroup.has(row.group_id)) byGroup.set(row.group_id, [])
+    byGroup.get(row.group_id).push(row)
+  }
+  const candidates = memberships
+    .map(m => ({
+      groupNote: m.card_group?.note ?? null,
+      others: (byGroup.get(m.group_id) ?? [])
+        .filter(r => r.card_id !== cardId && r.knowledge_cards)
+        .map(r => ({ name: r.knowledge_cards.name, note: r.note })),
+    }))
+    .filter(c => c.others.length > 0)
+  if (candidates.length === 0) return null
+  return candidates[Math.floor(Math.random() * candidates.length)]
 }
 
 export default async function handler(req, res) {
@@ -128,9 +162,21 @@ export default async function handler(req, res) {
   // problemType (and therefore a different tool schema/mode) than the conversation already has
   // turns for. Only trusted when it resolves; otherwise falls through to a fresh pick below and
   // the stale history is discarded (see effectiveHistory).
-  let rule = rawHistory.length > 0 && typeof problem_type === 'string'
-    ? resolvePracticeRule(ruleLookupType, problem_type, { cardName: effectiveCard.name, cardTags: effectiveCard.tags })
-    : null
+  //
+  // discrimination_cloze (Card Groups, plan.md) is a special case: it has no static row in
+  // SKILL_PROBLEM_TYPES for resolvePracticeRule to find (its extraPrompt is built from the card's
+  // live group membership, not fixed prompt text), so continuing one means re-fetching that
+  // membership and rebuilding the rule rather than a table lookup. Falls through to a fresh pick
+  // (like any other unresolvable problem_type) if the card is no longer grouped.
+  let rule = null
+  if (rawHistory.length > 0 && problem_type === 'discrimination_cloze') {
+    const discriminationGroup = await pickDiscriminationGroup(effectiveCard.id)
+    if (discriminationGroup) {
+      rule = buildDiscriminationRule({ cardName: effectiveCard.name, groupNote: discriminationGroup.groupNote, otherMembers: discriminationGroup.others })
+    }
+  } else if (rawHistory.length > 0 && typeof problem_type === 'string') {
+    rule = resolvePracticeRule(ruleLookupType, problem_type, { cardName: effectiveCard.name, cardTags: effectiveCard.tags })
+  }
   const continuingHistory = rule != null
 
   if (!rule) {
@@ -157,6 +203,26 @@ export default async function handler(req, res) {
   if (senseGloss != null && !substituted) {
     const senseNote = `This word has multiple senses; drill specifically the sense glossed as "${senseGloss}" — do not test any other sense of this word.`
     rule = { ...rule, extraPrompt: rule.extraPrompt ? `${rule.extraPrompt}\n\n${senseNote}` : senseNote }
+  }
+
+  // Card Groups (plan.md) — "prefer a discrimination item over a plain one" for a grouped card's
+  // plain `meaning` skill. "Prefer" here means "always, when eligible": discrimination's entire
+  // value is a guaranteed-plausible distractor (the group's real other members, not something
+  // invented), so once a group is available there's no reason to fall back to the ordinary
+  // meaning rule's weighted pool. Skipped when continuing an "Easier sentence" chain (must keep
+  // whatever problemType it already committed to), after a substitution (a different card/skill
+  // entirely — its own group eligibility, if any, is a fresh check this request never makes), or
+  // for a sense skill (group membership is card-level; cross-sense confusion isn't handled here).
+  if (!continuingHistory && !substituted && senseGloss == null && effectiveSkillType === 'meaning') {
+    const discriminationGroup = await pickDiscriminationGroup(effectiveCard.id)
+    if (discriminationGroup) {
+      const discriminationRule = buildDiscriminationRule({
+        cardName: effectiveCard.name,
+        groupNote: discriminationGroup.groupNote,
+        otherMembers: discriminationGroup.others,
+      })
+      if (discriminationRule) rule = discriminationRule
+    }
   }
 
   const { questionType: mode, problemType, extraPrompt } = rule
@@ -186,6 +252,10 @@ export default async function handler(req, res) {
   // onCheck. Awaited alongside the outcome below so a failed generation still gets its check
   // attempt(s) recorded, not just a successful one.
   const checkLogs = []
+  // Every raw Anthropic call generatePracticeItem makes — the item-generation call(s) via onUsage,
+  // and (mc_cloze only) each per-option answer-uniqueness check via onCheckUsage — logged to
+  // llm_api_call regardless of whether generation ultimately succeeds, same reasoning as checkLogs.
+  const usageLogs = []
   try {
     const item = await generatePracticeItem({
       anthropic, model: MODEL, checkModel: CHECK_MODEL, mode, promptContext, history: effectiveHistory,
@@ -196,8 +266,25 @@ export default async function handler(req, res) {
           model: CHECK_MODEL, item: checkedItem, verification,
         }))
       },
+      onUsage: ({ model: usedModel, usage, stopReason, latencyMs, isRetry }) => {
+        usageLogs.push(logLlmApiCall({
+          projectId: project_id, userId: user.id,
+          purpose: isRetry ? 'practice_retry' : 'practice_generate',
+          model: usedModel, usage, stopReason, latencyMs,
+          cardId: effectiveCard.id, skillId: effectiveSkillId,
+          metadata: { skill_type: effectiveSkillType, problem_type: problemType, substituted },
+        }))
+      },
+      onCheckUsage: ({ model: usedModel, usage, stopReason, latencyMs }) => {
+        usageLogs.push(logLlmApiCall({
+          projectId: project_id, userId: user.id, purpose: 'mc_cloze_check',
+          model: usedModel, usage, stopReason, latencyMs,
+          cardId: effectiveCard.id, skillId: effectiveSkillId,
+          metadata: { skill_type: effectiveSkillType },
+        }))
+      },
     })
-    await Promise.all(checkLogs)
+    await Promise.all([...checkLogs, ...usageLogs])
     // card/skill_type reflect what was ACTUALLY generated for — may differ from the request's
     // card_id/skill_type when a silent substitution happened above. The client uses these, not
     // its own request values, for anything downstream of this item (result recording, Explain,
@@ -208,7 +295,7 @@ export default async function handler(req, res) {
     // problemType via resolvePracticeRule above, instead of re-rolling it.
     return res.status(200).json({ item, mode, request, card: effectiveCard, skill_type: effectiveSkillType, seed_card_names: seedCardNames, problem_type: problemType })
   } catch (e) {
-    await Promise.all(checkLogs)
+    await Promise.all([...checkLogs, ...usageLogs])
     if (e instanceof PracticeGenerationFailedError) {
       return res.status(422).json({ error: e.message, detail: e.detail })
     }

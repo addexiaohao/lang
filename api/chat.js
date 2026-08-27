@@ -4,10 +4,11 @@ import { supabase } from '../lib/supabaseAdmin.js'
 import { getProjectConfig } from '../lib/projectConfig.js'
 import { findDuplicateSource } from '../lib/normalizeSourceText.js'
 import { compose } from '../lib/prompts/registry.js'
-import { runChatLoop } from '../lib/chatLoop.js'
+import { runChatLoop, CHAT_MODEL } from '../lib/chatLoop.js'
 import { isSenseExempt, hasSenseAxis, senseValues, axisValueKey, axisValueGloss, axisValueExample } from '../lib/skillTypes.js'
 import { getSenseVerdict } from '../lib/senseCheck.js'
 import { languageName } from '../lib/prompts/fragments.js'
+import { logLlmApiCall } from '../lib/llmUsageLog.js'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
@@ -78,6 +79,7 @@ export default async function handler(req, res) {
 
     const { verdict, reasoning } = await getSenseVerdict({
       anthropic, projectId: project_id, lemma: card.name, excerpt, languageName: languageName(projectConfig.ttsLocale),
+      userId: user.id, cardId: card.id,
     })
     return { ...card, senses, sense_check: { verdict, reasoning } }
   }
@@ -105,13 +107,36 @@ export default async function handler(req, res) {
   // Suppress Vercel's default response buffering
   res.setHeader('X-Accel-Buffering', 'no')
 
-  await runChatLoop({
-    anthropic,
-    systemPrompt,
-    messages,
-    executeTool,
-    onText: text => res.write(text),
-  })
+  // One llm_api_call row per Anthropic call, not per HTTP request — a save/dedup tool round trip
+  // means runChatLoop's while(true) can call Anthropic more than once per POST. Collected and
+  // awaited before res.end() rather than fired-and-forgotten so the insert reliably completes
+  // before this serverless invocation is torn down.
+  const usageLogs = []
+  let turn = 0
+  try {
+    await runChatLoop({
+      anthropic,
+      systemPrompt,
+      messages,
+      executeTool,
+      onText: text => res.write(text),
+      onUsage: ({ model, usage, stopReason, latencyMs }) => {
+        turn += 1
+        usageLogs.push(logLlmApiCall({
+          projectId: project_id, userId: user.id, purpose: 'chat', model,
+          usage, stopReason, latencyMs, metadata: { turn },
+        }))
+      },
+    })
+  } catch (e) {
+    usageLogs.push(logLlmApiCall({
+      projectId: project_id, userId: user.id, purpose: 'chat', model: CHAT_MODEL,
+      status: 'error', errorMessage: e.message, metadata: { turn: turn + 1 },
+    }))
+    await Promise.all(usageLogs)
+    throw e
+  }
 
+  await Promise.all(usageLogs)
   res.end()
 }

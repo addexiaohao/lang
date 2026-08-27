@@ -1,13 +1,12 @@
-// Recomputes every skill's practice-scheduling cache (state, interval_days, due_at,
-// consecutive_correct, stable_interval_days — schema.sql's skill table comment, plan.md §6) from
-// scratch by replaying its full practice_attempt history through the exact same
-// computeSchedule()/nextLevel() functions the live PATCH path uses (lib/practiceScheduling.js) —
-// so drift between the two is always fixable by just re-running this.
+// Recomputes every skill's practice-scheduling cache (state, interval_days, due_at — schema.sql's
+// skill table comment) from scratch by replaying its full practice_attempt history through the
+// exact same computeSchedule()/nextLevel() functions the live PATCH path uses
+// (lib/practiceScheduling.js) — so drift between the two is always fixable by just re-running this.
 //
-// Only writes the five scheduling-cache columns — never touches `skill.level` itself, since that's
-// the authoritative field (plan.md §7: level computation is out of scope here) and can diverge from
-// a pure outcome-replay whenever a manual hand_set edit happened somewhere in the middle of a
-// skill's history (hand_set edits aren't logged to practice_attempt, so a replay can't see them).
+// Only writes the three scheduling-cache columns — never touches `skill.level` itself, since that's
+// the authoritative field (level computation is out of scope here) and can diverge from a pure
+// outcome-replay whenever a manual hand_set edit happened somewhere in the middle of a skill's
+// history (hand_set edits aren't logged to practice_attempt, so a replay can't see them).
 // The one place this matters is retirement: after replaying, the skill's ACTUAL current level
 // (fetched fresh, not the replayed one) is checked, and always wins — a hand-set level 10 always
 // ends up 'retired' here regardless of what the attempt-only replay computed.
@@ -53,9 +52,7 @@ function changed(current, recomputed) {
   return (
     current.state !== recomputed.state ||
     current.interval_days !== recomputed.interval_days ||
-    (current.due_at ? new Date(current.due_at).toISOString() : null) !== recomputed.due_at ||
-    current.consecutive_correct !== recomputed.consecutive_correct ||
-    current.stable_interval_days !== recomputed.stable_interval_days
+    (current.due_at ? new Date(current.due_at).toISOString() : null) !== recomputed.due_at
   )
 }
 
@@ -68,7 +65,7 @@ async function main() {
   while (true) {
     const { data: skills, error } = await supabase
       .from('skill')
-      .select('id, level, state, interval_days, due_at, consecutive_correct, stable_interval_days')
+      .select('id, level, state, interval_days, due_at')
       .order('id', { ascending: true })
       .range(offset, offset + PAGE_SIZE - 1)
     if (error) {

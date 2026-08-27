@@ -6,6 +6,7 @@ import SaveCard from './SaveCard.jsx'
 import LinkCard from './LinkCard.jsx'
 import GermanText from './GermanText.jsx'
 import { apiFetch } from '../apiFetch.js'
+import { createCardGroup, addCardToGroup, fetchCardGroups } from '../cardGroupActions.js'
 
 const TABLE_SCHEMA = {
   source: {
@@ -238,6 +239,17 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
     setEditedAnnotatedSentences(prev => ({ ...prev, [bi]: value }))
   }, [])
 
+  // "Relate to…" on a proposed save:knowledge_card block (plan.md — "Card Groups"): the target
+  // card(s) picked before the new card even exists (SaveCard.jsx's RelateToStaged), keyed by
+  // blockIndex. Applied for real in handleSave once the card is actually saved and its id is
+  // known — see applyStagedRelates below. relateStates tracks that deferred step's own
+  // relating/done/error status, separate from saveStates (which is about the card save itself).
+  const [relateTargets, setRelateTargets] = useState({})
+  const [relateStates, setRelateStates] = useState({})
+  const updateRelateTargets = useCallback((bi, targets) => {
+    setRelateTargets(prev => ({ ...prev, [bi]: targets }))
+  }, [])
+
   useEffect(() => {
     if (isUser) return
 
@@ -292,6 +304,22 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
     )
   }
 
+  // A brand-new card can't already belong to a group, so unlike CardDetailPanel's/LinkCard's
+  // "Relate this card…" there's no 0/1/many ambiguity to resolve here — the first staged target
+  // always creates a fresh group with the new card, and any further staged targets just join that
+  // same group.
+  async function applyStagedRelates(newCardId, targets) {
+    if (!targets || targets.length === 0) return
+    await createCardGroup(projectId, [newCardId, targets[0].id])
+    if (targets.length > 1) {
+      const groups = await fetchCardGroups(projectId, newCardId)
+      const groupId = groups[0]?.id
+      if (groupId) {
+        for (const t of targets.slice(1)) await addCardToGroup(projectId, groupId, t.id)
+      }
+    }
+  }
+
   async function handleSave(bi, table, fields) {
     setSaveStates(prev => prev.map((s, i) => i === bi ? { status: 'saving' } : s))
     try {
@@ -318,6 +346,15 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
         onSourceSaved?.(ref, data.id)
       }
       setSaveStates(prev => prev.map((s, i) => i === bi ? { status: 'saved', id: data.id } : s))
+      if (table === 'knowledge_card' && relateTargets[bi]?.length) {
+        setRelateStates(prev => ({ ...prev, [bi]: { status: 'relating' } }))
+        try {
+          await applyStagedRelates(data.id, relateTargets[bi])
+          setRelateStates(prev => ({ ...prev, [bi]: { status: 'done' } }))
+        } catch (e) {
+          setRelateStates(prev => ({ ...prev, [bi]: { status: 'error', error: String(e.message || e) } }))
+        }
+      }
     } catch (err) {
       setSaveStates(prev => prev.map((s, i) => i === bi ? { status: 'error', error: err.message } : s))
     }
@@ -474,6 +511,9 @@ export default function ChatMessage({ role, content, sourceRefMap = {}, onSource
                   onLink={isKnowledgeCard ? (cardId) => handleLink(bi, cardId) : undefined}
                   annotatedSentence={editedAnnotatedSentences[bi] ?? segment.annotatedSentence}
                   onAnnotatedSentenceChange={value => updateAnnotatedSentence(bi, value)}
+                  relateTargets={isKnowledgeCard ? relateTargets[bi] : undefined}
+                  onRelateTargetsChange={isKnowledgeCard ? (targets) => updateRelateTargets(bi, targets) : undefined}
+                  relateState={isKnowledgeCard ? relateStates[bi] : undefined}
                 />
               </div>
             )

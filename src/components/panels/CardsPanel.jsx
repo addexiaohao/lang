@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from 'react'
 import { apiFetch } from '../../apiFetch.js'
 import { SkillBadge } from '../SkillBadge.jsx'
 import { MultiSelectPopover } from '../MultiSelectPopover.jsx'
+import { CardSearchBar } from '../CardSearchBar.jsx'
+import GermanText from '../GermanText.jsx'
 
 const PAGE_SIZE = 25
 const KINDS = ['vocabulary', 'grammar', 'expression']
@@ -76,6 +78,14 @@ export function CardsPanel({ activeProject, tagCatalog, onSelectCard, selectedCa
   const [merging, setMerging] = useState(false)
   const [mergeError, setMergeError] = useState(null)
 
+  // "Group these" (plan.md — "Card Groups" §2): groups relate CARDS, not skills, so this is seeded
+  // from the distinct cards behind the current skill selection but tracked independently — adding
+  // a card here via the search bar doesn't touch selectedSkills at all.
+  const [showGrouping, setShowGrouping] = useState(false)
+  const [groupingMembers, setGroupingMembers] = useState([])
+  const [creatingGroup, setCreatingGroup] = useState(false)
+  const [groupError, setGroupError] = useState(null)
+
   useEffect(() => {
     setSearch('')
     setDebouncedSearch('')
@@ -94,6 +104,9 @@ export function CardsPanel({ activeProject, tagCatalog, onSelectCard, selectedCa
     setSelectAllActive(false)
     setConfirmingMerge(false)
     setMergeError(null)
+    setShowGrouping(false)
+    setGroupingMembers([])
+    setGroupError(null)
   }, [activeProject?.id])
 
   useEffect(() => {
@@ -290,6 +303,34 @@ export function CardsPanel({ activeProject, tagCatalog, onSelectCard, selectedCa
     }
   }
 
+  // Creates a new group from `groupingMembers` (plan.md §2's "Group these" path — always a fresh
+  // group, unlike CardDetailPanel's "Relate this card…" which may add to an existing one). Members
+  // are unaffected otherwise — no merging, no skill changes.
+  async function handleCreateGroup() {
+    if (groupingMembers.length < 2 || !activeProject) return
+    setCreatingGroup(true)
+    setGroupError(null)
+    try {
+      const r = await apiFetch('/api/card-groups', {
+        method: 'POST',
+        body: JSON.stringify({ project_id: activeProject.id, member_card_ids: groupingMembers.map(c => c.id) }),
+      })
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}))
+        throw new Error(body.error || r.statusText)
+      }
+      setShowGrouping(false)
+      setGroupingMembers([])
+      setSelectedSkills(new Map())
+      setSelectAllActive(false)
+      setRefreshKey(k => k + 1)
+    } catch (e) {
+      setGroupError(String(e.message || e))
+    } finally {
+      setCreatingGroup(false)
+    }
+  }
+
   return (
     <div className="flex flex-col h-full min-w-0">
       <div
@@ -470,7 +511,9 @@ export function CardsPanel({ activeProject, tagCatalog, onSelectCard, selectedCa
                 </label>
                 <button onClick={() => onSelectCard(item)} className="flex-1 min-w-0 text-left pl-1 pr-3 py-2.5">
                   <div className="flex items-start justify-between gap-2">
-                    <span className="text-xs font-medium text-gray-800 leading-snug">{item.name}</span>
+                    <span className="text-xs font-medium text-gray-800 leading-snug truncate">
+                      <GermanText>{item.name}</GermanText>
+                    </span>
                     <span className={`text-[10px] rounded px-1.5 py-0.5 font-medium shrink-0 ${KIND_COLORS[item.kind] ?? 'bg-gray-100 text-gray-600'}`}>
                       {item.kind}
                     </span>
@@ -484,6 +527,14 @@ export function CardsPanel({ activeProject, tagCatalog, onSelectCard, selectedCa
                     )}
                     <span className="ml-auto flex items-center gap-2 shrink-0">
                       <SkillBadge card={item} skills={item.skills} />
+                      {item.group_count > 0 && (
+                        <span title={`In ${item.group_count} group${item.group_count > 1 ? 's' : ''}`} className="flex items-center gap-0.5 text-[10px] text-purple-500">
+                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-2.5 h-2.5">
+                            <circle cx="8" cy="8" r="4" /><circle cx="16" cy="16" r="4" /><path d="M11 11l2 2" />
+                          </svg>
+                          {item.group_count}
+                        </span>
+                      )}
                       <span title="Linked sources" className="flex items-center gap-0.5 text-[10px] text-gray-400">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-2.5 h-2.5">
                           <path d="M10 13a5 5 0 007.07 0l1.93-1.93a5 5 0 00-7.07-7.07L10.5 5.5" />
@@ -543,10 +594,18 @@ export function CardsPanel({ activeProject, tagCatalog, onSelectCard, selectedCa
             <div className="ml-auto flex items-center gap-2 shrink-0">
               {selectedCardCount >= 2 && (
                 <button
-                  onClick={() => { setMergeError(null); setConfirmingMerge(true) }}
+                  onClick={() => { setGroupError(null); setShowGrouping(false); setMergeError(null); setConfirmingMerge(true) }}
                   className="text-[10px] font-medium bg-amber-600 text-white rounded px-2.5 py-1 hover:bg-amber-700 transition-colors"
                 >
                   Merge {selectedCardCount} cards
+                </button>
+              )}
+              {selectedCardCount >= 2 && (
+                <button
+                  onClick={() => { setConfirmingMerge(false); setGroupError(null); setGroupingMembers(selectedCards); setShowGrouping(true) }}
+                  className="text-[10px] font-medium bg-purple-600 text-white rounded px-2.5 py-1 hover:bg-purple-700 transition-colors"
+                >
+                  Group these
                 </button>
               )}
               <button
@@ -557,6 +616,50 @@ export function CardsPanel({ activeProject, tagCatalog, onSelectCard, selectedCa
               </button>
             </div>
           </div>
+          {showGrouping && (
+            <div className="px-3 pb-2 pt-1 border-t border-purple-100 bg-purple-50/50 space-y-1.5">
+              <p className="text-[10px] text-gray-600">
+                Create a group from these {groupingMembers.length} cards — a set that only makes sense against each other. Add more below if needed.
+              </p>
+              <ul className="text-[10px] text-gray-600 space-y-0.5 max-h-20 overflow-y-auto">
+                {groupingMembers.map(c => (
+                  <li key={c.id} className="flex items-center justify-between gap-2">
+                    <span className="truncate">{c.name}</span>
+                    <button
+                      onClick={() => setGroupingMembers(prev => prev.filter(m => m.id !== c.id))}
+                      title="Remove"
+                      className="text-gray-300 hover:text-red-500 shrink-0"
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
+              <CardSearchBar
+                activeProject={activeProject}
+                excludeIds={groupingMembers.map(c => c.id)}
+                onSelect={c => setGroupingMembers(prev => [...prev, c])}
+                placeholder="Add another card…"
+              />
+              {groupError && <p className="text-[10px] text-red-500">{groupError}</p>}
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleCreateGroup}
+                  disabled={creatingGroup || groupingMembers.length < 2}
+                  className="text-[10px] font-medium text-white bg-purple-600 hover:bg-purple-700 disabled:opacity-60 rounded px-2 py-1 shrink-0 transition-colors"
+                >
+                  {creatingGroup ? 'Creating…' : 'Confirm group'}
+                </button>
+                <button
+                  onClick={() => setShowGrouping(false)}
+                  disabled={creatingGroup}
+                  className="text-[10px] text-gray-500 hover:text-gray-700 disabled:opacity-60 rounded px-2 py-1 shrink-0 transition-colors"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
           {confirmingMerge && (
             <div className="px-3 pb-2 pt-1 border-t border-amber-100 bg-amber-50/50 space-y-1.5">
               <p className="text-[10px] text-gray-600">

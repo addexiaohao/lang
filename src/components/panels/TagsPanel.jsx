@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { apiFetch } from '../../apiFetch.js'
+import GermanText from '../GermanText.jsx'
 
 const CARDS_PAGE_SIZE = 20
 
@@ -255,14 +256,14 @@ export function TagsPanel({ activeProject, tagCatalog, onNewTags, onDragStart, o
                 className="w-full text-left px-3 py-2.5 border-b border-gray-100 hover:bg-gray-50 transition-colors group flex items-start"
               >
                 <button onClick={() => handleTagClick(tag.name)} className="flex-1 min-w-0 text-left">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-sm text-gray-800 font-medium truncate">
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm text-gray-800 font-medium truncate flex-1 min-w-0">
                       {tag.name}
                       {tag.display_name && (
                         <span className="ml-1.5 text-[11px] font-normal text-gray-400">{tag.display_name}</span>
                       )}
                     </span>
-                    <span className="text-[10px] text-gray-400 shrink-0">
+                    <span className="text-[10px] text-gray-400 shrink-0 text-right">
                       {tag.card_count ?? 0} card{tag.card_count === 1 ? '' : 's'}
                     </span>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
@@ -351,7 +352,9 @@ export function TagsPanel({ activeProject, tagCatalog, onNewTags, onDragStart, o
               }`}
             >
               <div className="flex items-start justify-between gap-2">
-                <span className="text-sm text-gray-800 font-medium leading-snug">{card.name}</span>
+                <span className="text-sm text-gray-800 font-medium leading-snug truncate">
+                  <GermanText>{card.name}</GermanText>
+                </span>
                 <span className={`text-[10px] rounded px-1.5 py-0.5 shrink-0 ${KIND_COLORS[card.kind] ?? 'text-gray-500 bg-gray-100'}`}>
                   {card.kind}
                 </span>

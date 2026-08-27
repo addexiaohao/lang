@@ -241,6 +241,159 @@ create index if not exists idx_system_prompt_history_project_id on system_prompt
 alter table system_prompt_history  enable row level security;
 drop policy if exists "anon full access" on system_prompt_history;
 
+-- ── LLM API USAGE TRACKING ───────────────────────────────────────────────────
+-- One row per LLM API call, across every call site in the app: api/chat.js's streaming turns
+-- (including each tool-loop round), api/practice.js's item generation (+ its one retry, see
+-- "Practice generation" in CLAUDE.md), lib/mcClozeCheck.js's per-option answer-uniqueness checks,
+-- api/practice-explain.js's turns, lib/senseCheck.js's getSenseVerdict()/checkSense(), and
+-- api/suggest-sense.js. Purely a cost/usage log — nothing else in the app reads from it, so losing
+-- it doesn't corrupt any other data, but nothing currently regenerates it either, so treat existing
+-- rows as real history, same spirit as practice_attempt.
+--
+-- purpose identifies the CALL SITE, not the questionType/skill_type a practice call happened to be
+-- generating for (that's already on practice_attempt/mc_cloze_check_failure) — this table's job is
+-- "how much did this app spend on Anthropic", sliceable by feature. card_id/skill_id are nullable,
+-- best-effort links for call sites that have one (practice generation, mc_cloze checks, explain) —
+-- null for call sites that don't (chat, sense_check, suggest_sense at the point of call). Anything
+-- else call-site-specific (encounter_id, which skill_type was requested vs. substituted, a retry's
+-- reason) goes in metadata rather than growing a nullable column per purpose.
+--
+-- on delete set null (not cascade) on every FK here, deliberately: a cost/usage record should
+-- survive the project/card/skill it was about being deleted later — an audit trail, not derived
+-- state — unlike e.g. skill's practice_attempt rows, which are meant to disappear with their skill.
+create table if not exists llm_api_call (
+  id                          uuid primary key default gen_random_uuid(),
+  project_id                  uuid references projects(id) on delete set null,
+  user_id                     uuid references auth.users(id) on delete set null,
+  purpose                     text not null check (purpose in (
+                                 'chat', 'practice_generate', 'practice_retry', 'mc_cloze_check',
+                                 'practice_explain', 'sense_check', 'suggest_sense'
+                               )),
+  model                       text not null,
+  status                      text not null default 'success' check (status in ('success', 'error')),
+  error_message               text,
+  input_tokens                int,
+  output_tokens               int,
+  cache_creation_input_tokens int,          -- prompt-caching write (see CLAUDE.md's "Prompt caching")
+  cache_read_input_tokens     int,          -- prompt-caching read
+  stop_reason                 text,         -- e.g. 'end_turn' | 'tool_use' | 'max_tokens', null on error
+  latency_ms                  int,
+  cost_usd                    numeric(10,6), -- computed at write time from llm_model_pricing (below) —
+                                              -- a snapshot, so later price changes never rewrite history
+  request_id                  text,          -- Anthropic's anthropic-request-id response header
+  card_id                     uuid references knowledge_cards(id) on delete set null,
+  skill_id                    uuid references skill(id) on delete set null,
+  metadata                    jsonb,         -- free-form call-specific context, e.g.
+                                              -- {skill_type, encounter_id, retry_of, tool_calls}
+  created_at                  timestamptz not null default now()
+);
+
+create index if not exists idx_llm_api_call_project_created on llm_api_call(project_id, created_at desc);
+create index if not exists idx_llm_api_call_purpose         on llm_api_call(purpose);
+create index if not exists idx_llm_api_call_model           on llm_api_call(model);
+create index if not exists idx_llm_api_call_card_id         on llm_api_call(card_id);
+create index if not exists idx_llm_api_call_skill_id        on llm_api_call(skill_id);
+
+alter table llm_api_call enable row level security;
+drop policy if exists "anon full access" on llm_api_call;
+
+-- Per-model $/1M-token pricing, effective from a given date. Kept as data rather than a hardcoded
+-- rate table in code so a price change (Anthropic repricing a model) doesn't require a deploy, and
+-- so cost_usd on already-logged calls stays correct forever — the resolver (would-be
+-- lib/llmPricing.js) picks the newest row with effective_from <= the call's time for the model
+-- actually used, then that resulting number is written once onto llm_api_call.cost_usd, never
+-- recomputed by joining at read time.
+create table if not exists llm_model_pricing (
+  id                           uuid primary key default gen_random_uuid(),
+  model                        text not null,
+  input_cost_per_million       numeric(10,4) not null,
+  output_cost_per_million      numeric(10,4) not null,
+  cache_write_cost_per_million numeric(10,4),
+  cache_read_cost_per_million  numeric(10,4),
+  effective_from               timestamptz not null default now(),
+  created_at                   timestamptz not null default now(),
+  unique (model, effective_from)
+);
+
+create index if not exists idx_llm_model_pricing_model on llm_model_pricing(model, effective_from desc);
+
+alter table llm_model_pricing enable row level security;
+drop policy if exists "anon full access" on llm_model_pricing;
+
+-- Seed pricing for every model this app currently hardcodes — CHAT_MODEL (lib/chatLoop.js),
+-- DEFAULT_PRACTICE_MODEL (lib/practiceGenerate.js), DEFAULT_CHECK_MODEL (lib/mcClozeCheck.js), and
+-- DEFAULT_SENSE_CHECK_MODEL (lib/senseCheck.js) all resolve to claude-sonnet-4-6 today, and
+-- PRACTICE_MODEL/PRACTICE_CHECK_MODEL default to the same when unset. Cache write/read rates use
+-- Anthropic's standard multipliers (1.25x / 0.1x of the base input rate) since those aren't published
+-- as separate flat per-model prices. effective_from is pinned (not now()) so re-running this
+-- migration updates the same row via ON CONFLICT instead of inserting a new one on every deploy —
+-- bump the date only for a real, dated price change. A PRACTICE_MODEL/PRACTICE_CHECK_MODEL override
+-- pointing at a model with no row here just means lib/llmPricing.js's cost_usd comes back null for
+-- those calls — token counts still log fine either way.
+insert into llm_model_pricing (model, input_cost_per_million, output_cost_per_million, cache_write_cost_per_million, cache_read_cost_per_million, effective_from)
+values ('claude-sonnet-4-6', 3.00, 15.00, 3.75, 0.30, '2026-01-01T00:00:00Z')
+on conflict (model, effective_from) do update set
+  input_cost_per_million       = excluded.input_cost_per_million,
+  output_cost_per_million      = excluded.output_cost_per_million,
+  cache_write_cost_per_million = excluded.cache_write_cost_per_million,
+  cache_read_cost_per_million  = excluded.cache_read_cost_per_million;
+
+-- ── PRACTICE NOTES ───────────────────────────────────────────────────────────
+-- Dev/self-use only: a free-text scratch note attached to a practice question while practicing
+-- (e.g. "this distractor is questionable", "I keep confusing this with X"). Not surfaced anywhere
+-- in the UI beyond the button that writes it — just a durable place to park an observation for
+-- later review. `question` is the raw generated item (same shape as
+-- practice_attempt.conversation.response) so the note can be read back against exactly what was
+-- on screen; `skill_id` ties it to the skill being drilled, same as practice_attempt.
+create table if not exists practice_note (
+  id         uuid primary key default gen_random_uuid(),
+  skill_id   uuid not null references skill(id) on delete cascade,
+  question   jsonb not null,
+  note       text not null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_practice_note_skill_id on practice_note(skill_id);
+
+alter table practice_note enable row level security;
+drop policy if exists "anon full access" on practice_note;
+
+-- ── CARD GROUPS ───────────────────────────────────────────────────────────────
+-- plan.md — lets the user relate cards that only make sense against each other (wissen/kennen,
+-- legen/stellen/setzen) so practice can generate discrimination items whose distractors are
+-- guaranteed plausible (they're the OTHER group members, not model-invented). A group is a set of
+-- cards, not pairwise edges — legen/stellen/setzen is one three-way relation, and edges would admit
+-- inconsistent triangles (A-B, B-C, no A-C). Groups relate CARDS, not skills — item generation
+-- resolves card -> skill at generation time (api/practice.js). A card may belong to several groups
+-- (no uniqueness constraint on card_id alone), and groups are never merged/deduplicated — two
+-- groups with identical members are allowed.
+create table if not exists card_group (
+  id          uuid primary key default gen_random_uuid(),
+  project_id  uuid not null references projects(id) on delete cascade,
+  name        text,     -- nullable; UI falls back to member names joined, e.g. "wissen · kennen"
+  note        text,     -- the shared axis of comparison, e.g. "both mean 'to know'; the split is ..."
+  created_at  timestamptz not null default now()
+);
+
+-- note: what is distinctive about THIS member specifically, e.g. "kennen — people, places, things
+-- you have encountered." Both this and card_group.note are nullable/optional — when null, the
+-- agent regenerates a serviceable explanation on demand rather than it being stored redundantly.
+create table if not exists card_group_member (
+  group_id    uuid not null references card_group(id) on delete cascade,
+  card_id     uuid not null references knowledge_cards(id) on delete cascade,
+  note        text,
+  created_at  timestamptz not null default now(),
+  primary key (group_id, card_id)
+);
+
+create index if not exists idx_card_group_project_id on card_group(project_id);
+create index if not exists idx_card_group_member_card_id on card_group_member(card_id);
+
+alter table card_group        enable row level security;
+alter table card_group_member enable row level security;
+drop policy if exists "anon full access" on card_group;
+drop policy if exists "anon full access" on card_group_member;
+
 -- ── INDEXES ───────────────────────────────────────────────────────────────────
 
 create index if not exists idx_projects_user_id           on projects(user_id);
@@ -359,28 +512,32 @@ begin
   end if;
 end $$;
 
--- Practice scheduling (plan.md — "Practice Scheduling"). Four caches recomputable from
--- practice_attempt (lib/practiceScheduling.js's computeSchedule() is the one place that derives
--- them) — the attempt log stays the source of truth, and scripts/recompute-schedule.js re-derives
--- these from scratch if they ever drift.
---   state: 'never' (no attempts) | 'learning' (has attempts, never yet reached 'stable') |
---     'relearning' (failed since its last promotion to 'stable' — needs 2 consecutive correct to
---     exit) | 'stable' (passing, on the expanding interval ladder) | 'retired' (level 10, never
---     scheduled again). See lib/practiceScheduling.js for the exact transition rules.
---   interval_days / due_at: the expanding-interval ladder (plan.md §2: 1/3/7/16/35 days).
---   consecutive_correct: only meaningful while `state = 'relearning'` — counts toward the 2
---     consecutive corrects needed to exit.
--- stable_interval_days is NOT one of plan.md §6's four named columns — it was added because
--- implementing §2's "rejoin the ladder at its previous rung minus one" literally requires
--- remembering the rung a skill fell FROM when it entered relearning, and interval_days itself gets
--- pinned to 1 for the whole relearning episode (so it can't double as that memory). Same
--- recomputable-cache status as the other four.
+-- Practice scheduling. Caches recomputable from practice_attempt (lib/practiceScheduling.js's
+-- computeSchedule() is the one place that derives them) — the attempt log stays the source of
+-- truth, and scripts/recompute-schedule.js re-derives these from scratch if they ever drift.
+--   state: 'never' (no attempts) | 'learning' (most recent answer was wrong — this is the single
+--     catch-all for "not currently proven," whether that's a skill that's never once been right or
+--     one that just lapsed after being 'stable'; there is no separate lapse bucket) |
+--     'relearning' (proven once — one correct answer while 'learning' — but not yet confirmed; one
+--     more correct in a row exits to 'stable', one more incorrect drops back to 'learning') |
+--     'stable' (confirmed: reached via a first-try correct straight from 'never', or via two
+--     correct answers in a row out of 'learning') | 'retired' (level 10, never scheduled again).
+--     See lib/practiceScheduling.js for the exact transition table.
+--   interval_days / due_at: the expanding-interval ladder (roughly 1/3/7/16/35 days), derived
+--     ONLY from the skill's current `level` (lib/practiceScheduling.js's intervalForLevel()) — not
+--     from `state` or attempt history, so there's no rung/streak memory to keep here.
 alter table skill add column if not exists state text not null default 'never'
   check (state in ('never', 'learning', 'relearning', 'stable', 'retired'));
 alter table skill add column if not exists interval_days smallint;
 alter table skill add column if not exists due_at timestamptz;
-alter table skill add column if not exists consecutive_correct smallint not null default 0;
-alter table skill add column if not exists stable_interval_days smallint;
+
+-- consecutive_correct/stable_interval_days: dropped. The old model needed them to remember a
+-- relearning streak count and the ladder rung a skill fell from; the state machine above replaced
+-- both (state itself encodes streak progress, and interval_days depends only on level), and no code
+-- has read or written either column since. skill is reset-friendly (see "Schema migration
+-- strategy"), so an explicit drop here is fine rather than leaving them as permanent dead weight.
+alter table skill drop column if exists consecutive_correct;
+alter table skill drop column if exists stable_interval_days;
 
 create index if not exists idx_skill_state_due_at on skill(state, due_at);
 create index if not exists idx_skill_due_at on skill(due_at);
@@ -721,10 +878,22 @@ $$;
 -- literally "what happened last time", for the Skills page's right/wrong/never-tested indicator
 -- and its 'last_result' sort.
 --
+-- schedule_state/interval_days/due_at are the raw `skill.state`/`interval_days`/`due_at` cache
+-- columns (lib/practiceScheduling.js) passed through verbatim — the spaced-repetition FSM
+-- (never/learning/relearning/stable/retired), NOT the same thing as practice_state above (that's a
+-- display-oriented derivation recomputed fresh from practice_attempt every call; schedule_state is
+-- the cached scheduling value, named differently on purpose so the two are never confused).
+--
 -- CASCADE: browse_skills/skill_level_histogram/browse_cards below all call this as a set-returning
 -- FROM-clause function, which Postgres records as a real dependency — changing this function's OUT
 -- row shape (adding last_outcome) requires dropping it, which drags those down with it. All three
 -- are unconditionally recreated later in this same file, so this is safe to reapply every migrate.
+--
+-- card_group_count: how many card_group rows this skill's card belongs to (plan.md — "Card
+-- Groups") — a per-CARD value, duplicated across every skill row of that card, same convention
+-- card_importance already uses. Powers the Skills page's group indicator (browse_skills); browse_cards
+-- computes its own copy directly against knowledge_cards instead of reusing this one, since a
+-- paradigm card can have zero skill rows at all (no row here to carry the count on).
 drop function if exists skill_practice_state(uuid) cascade;
 create or replace function skill_practice_state(p_project_id uuid)
 returns table (
@@ -747,9 +916,16 @@ returns table (
   failed_count      int,
   too_hard_count    int,
   last_attempt_at   timestamptz,
-  last_outcome      text
+  last_outcome      text,
+  schedule_state    text,
+  interval_days     smallint,
+  due_at            timestamptz,
+  card_group_count  int
 ) language sql stable as $$
-  with encounters as (
+  with group_counts as (
+    select card_id, count(*)::int as cnt from card_group_member group by card_id
+  ),
+  encounters as (
     select
       pa.skill_id,
       pa.encounter_id,
@@ -789,10 +965,13 @@ returns table (
     coalesce(sa.failed_count, 0),
     coalesce(sa.too_hard_count, 0),
     sa.last_attempt_at,
-    sa.last_final_outcome
+    sa.last_final_outcome,
+    s.state, s.interval_days, s.due_at,
+    coalesce(gc.cnt, 0)
   from skill s
   join knowledge_cards c on c.id = s.card_id
   left join skill_agg sa on sa.skill_id = s.id
+  left join group_counts gc on gc.card_id = c.id
   where c.project_id = p_project_id;
 $$;
 
@@ -809,27 +988,34 @@ $$;
 -- the audit. 'last_result' ranks by last_outcome — wrong (incorrect/too_hard), then right
 -- (correct), then never-tested (null) ascending, reversed on descending — per the Skills page's
 -- right/wrong/never-tested indicator.
-drop function if exists browse_skills(uuid, text, smallint, smallint, text[], text, text[], text, text, text, int, int);
+--
+-- p_schedule_state filters on the SAME schedule_state (never/learning/relearning/stable/retired)
+-- the summary strip (skill_schedule_state_counts below) displays — clicking a strip badge sets
+-- this, same interaction as clicking a histogram bar sets p_level_min/p_level_max.
+drop function if exists browse_skills(uuid, text, smallint, smallint, text[], text, text[], text, text, text, int, int, text);
 create or replace function browse_skills(
-  p_project_id  uuid,
-  p_skill_type  text default null,
-  p_level_min   smallint default null,
-  p_level_max   smallint default null,
-  p_states      text[] default null,
-  p_kind        text default null,
-  p_tags        text[] default null,
-  p_search      text default null,
-  p_sort        text default 'level',
-  p_sort_dir    text default 'asc',
-  p_limit       int default 25,
-  p_offset      int default 0
+  p_project_id     uuid,
+  p_skill_type     text default null,
+  p_level_min      smallint default null,
+  p_level_max      smallint default null,
+  p_states         text[] default null,
+  p_kind           text default null,
+  p_tags           text[] default null,
+  p_search         text default null,
+  p_sort           text default 'level',
+  p_sort_dir       text default 'asc',
+  p_limit          int default 25,
+  p_offset         int default 0,
+  p_schedule_state text default null
 ) returns table (
   skill_id uuid, type text, level smallint, importance smallint, hand_set boolean,
   last_correct timestamptz, skill_created_at timestamptz,
   card_id uuid, card_name text, card_kind text, card_tags text[], card_importance smallint,
   card_details jsonb, card_created_at timestamptz,
   practice_state text, attempt_count int, failed_count int, too_hard_count int,
-  last_attempt_at timestamptz, last_outcome text, total_count bigint
+  last_attempt_at timestamptz, last_outcome text,
+  schedule_state text, interval_days smallint, due_at timestamptz, card_group_count int,
+  total_count bigint
 ) language sql stable as $$
   select s.*, count(*) over()
   from skill_practice_state(p_project_id) s
@@ -841,6 +1027,7 @@ create or replace function browse_skills(
     and (p_kind is null or s.card_kind = p_kind)
     and (p_tags is null or s.card_tags @> p_tags)
     and (p_search is null or s.card_name ilike '%' || p_search || '%')
+    and (p_schedule_state is null or s.schedule_state = p_schedule_state)
   order by
     case when p_sort = 'level' and p_sort_dir = 'asc'  then s.level end asc nulls last,
     case when p_sort = 'level' and p_sort_dir = 'desc' then s.level end desc nulls last,
@@ -871,13 +1058,17 @@ $$;
 
 -- Level histogram (plan.md §4) — same filters as browse_skills MINUS level, grouped by level.
 -- Levels with zero matching skills simply don't appear; the client fills in empty bars.
+-- p_schedule_state — see browse_skills's comment above; the histogram still respects an active
+-- schedule-state filter (only level itself is excluded, since that's this function's own axis).
+drop function if exists skill_level_histogram(uuid, text, text[], text, text[], text);
 create or replace function skill_level_histogram(
-  p_project_id  uuid,
-  p_skill_type  text default null,
-  p_states      text[] default null,
-  p_kind        text default null,
-  p_tags        text[] default null,
-  p_search      text default null
+  p_project_id     uuid,
+  p_skill_type     text default null,
+  p_states         text[] default null,
+  p_kind           text default null,
+  p_tags           text[] default null,
+  p_search         text default null,
+  p_schedule_state text default null
 ) returns table (level smallint, count bigint) language sql stable as $$
   select s.level, count(*)
   from skill_practice_state(p_project_id) s
@@ -888,8 +1079,40 @@ create or replace function skill_level_histogram(
     and (p_kind is null or s.card_kind = p_kind)
     and (p_tags is null or s.card_tags @> p_tags)
     and (p_search is null or s.card_name ilike '%' || p_search || '%')
+    and (p_schedule_state is null or s.schedule_state = p_schedule_state)
   group by s.level
   order by s.level;
+$$;
+
+-- Schedule-state counts (never/learning/relearning/stable/retired — lib/practiceScheduling.js) for
+-- the Skills page's summary strip. Same full filter set as browse_skills, level filter included
+-- (unlike skill_level_histogram, which deliberately excludes it since it's the thing generating the
+-- level buttons) — deliberately has NO p_schedule_state param of its own, same reasoning: this
+-- function generates the state buttons the client clicks to set browse_skills'/
+-- skill_level_histogram's p_schedule_state, so every badge's count must stay independent of
+-- whichever one is currently active, or picking a state would zero out the others. States with
+-- zero matches simply don't appear; the client fills in zero for the rest.
+create or replace function skill_schedule_state_counts(
+  p_project_id  uuid,
+  p_skill_type  text default null,
+  p_level_min   smallint default null,
+  p_level_max   smallint default null,
+  p_states      text[] default null,
+  p_kind        text default null,
+  p_tags        text[] default null,
+  p_search      text default null
+) returns table (schedule_state text, count bigint) language sql stable as $$
+  select s.schedule_state, count(*)
+  from skill_practice_state(p_project_id) s
+  where
+    (p_skill_type is null or s.type = p_skill_type)
+    and (p_level_min is null or s.level >= p_level_min)
+    and (p_level_max is null or s.level <= p_level_max)
+    and (p_states is null or s.practice_state = any(p_states))
+    and (p_kind is null or s.card_kind = p_kind)
+    and (p_tags is null or s.card_tags @> p_tags)
+    and (p_search is null or s.card_name ilike '%' || p_search || '%')
+  group by s.schedule_state;
 $$;
 
 -- Cards panel additions (plan.md §7) — same list shape as the plain knowledge_cards query
@@ -901,6 +1124,7 @@ $$;
 -- p_below_level, so no extra join needed). p_practice_state: 'never_practiced' (no skill on the
 -- card has ever been attempted) | 'has_failures' (at least one skill's current state is 'failing'
 -- or 'too_hard').
+drop function if exists browse_cards(uuid, text, text, text[], smallint, text, text, text, int, int);
 create or replace function browse_cards(
   p_project_id      uuid,
   p_search          text default null,
@@ -915,7 +1139,7 @@ create or replace function browse_cards(
 ) returns table (
   card_id uuid, name text, kind text, tags text[], importance smallint, details jsonb,
   created_at timestamptz, link_count bigint, min_level smallint, mean_level numeric,
-  last_practiced timestamptz, skills jsonb, total_count bigint
+  last_practiced timestamptz, skills jsonb, group_count bigint, total_count bigint
 ) language sql stable as $$
   with card_skill_agg as (
     select
@@ -933,16 +1157,26 @@ create or replace function browse_cards(
     select knowledge_card_id, count(*) as cnt
     from source_knowledge
     group by knowledge_card_id
+  ),
+  -- Computed directly against card_group_member (plan.md — "Card Groups"), not routed through
+  -- card_skill_agg/skill_practice_state, since a paradigm card can have zero skill rows at all
+  -- (lazily created) and would otherwise never show a group badge despite genuinely being grouped.
+  group_counts as (
+    select card_id, count(*) as cnt
+    from card_group_member
+    group by card_id
   )
   select
     c.id, c.name, c.kind, c.tags, c.importance, c.details, c.created_at,
     coalesce(lc.cnt, 0),
     csa.min_level, csa.mean_level, csa.last_practiced,
     coalesce(csa.skills, '[]'::jsonb),
+    coalesce(gc.cnt, 0),
     count(*) over()
   from knowledge_cards c
   left join card_skill_agg csa on csa.card_id = c.id
   left join link_counts lc on lc.knowledge_card_id = c.id
+  left join group_counts gc on gc.card_id = c.id
   where
     c.project_id = p_project_id
     and (p_search is null or c.name ilike '%' || p_search || '%')
@@ -971,6 +1205,44 @@ create or replace function browse_cards(
     case when p_sort = 'last_practiced' then csa.last_practiced end asc nulls last,
     c.id
   limit p_limit offset p_offset;
+$$;
+
+-- Usage/cost rollup over llm_api_call, grouped by purpose+model — backs a future usage dashboard the
+-- same way browse_cards/browse_skills back their panels. p_project_id is nullable ("every project the
+-- caller can see" is left to the API layer, which already scopes by project ownership before calling
+-- this); p_from/p_to bound created_at for a billing-period view.
+create or replace function llm_usage_summary(
+  p_project_id uuid default null,
+  p_from       timestamptz default null,
+  p_to         timestamptz default null
+) returns table (
+  purpose             text,
+  model               text,
+  call_count          bigint,
+  error_count         bigint,
+  input_tokens        bigint,
+  output_tokens       bigint,
+  cache_read_tokens   bigint,
+  cache_write_tokens  bigint,
+  total_cost_usd      numeric,
+  avg_latency_ms      numeric
+) language sql stable as $$
+  select
+    purpose, model,
+    count(*),
+    count(*) filter (where status = 'error'),
+    sum(coalesce(input_tokens, 0)),
+    sum(coalesce(output_tokens, 0)),
+    sum(coalesce(cache_read_input_tokens, 0)),
+    sum(coalesce(cache_creation_input_tokens, 0)),
+    sum(coalesce(cost_usd, 0)),
+    avg(latency_ms)
+  from llm_api_call
+  where (p_project_id is null or project_id = p_project_id)
+    and (p_from is null or created_at >= p_from)
+    and (p_to is null or created_at < p_to)
+  group by purpose, model
+  order by purpose, model;
 $$;
 
 -- Auto-create user_settings row when a new Auth user is created.

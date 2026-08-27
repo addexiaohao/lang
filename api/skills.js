@@ -35,8 +35,19 @@ function resolveRow(row) {
 //   ?limit=1&offset=N      -> single row at offset N, for uniform random sampling (random-start),
 //                              same pattern api/knowledge-cards.js uses for cards
 //   ?browse=1&...          -> Skills page (plan.md): filtered/sorted/paginated rows with derived
-//                              practice state, via schema.sql's browse_skills RPC — see below
-//   ?histogram=1&...       -> Skills page's level histogram, via skill_level_histogram RPC
+//                              practice state, via schema.sql's browse_skills RPC — see below.
+//                              `schedule_state` (never/learning/relearning/stable/retired) filters
+//                              on the same column the summary strip below counts — clicking a
+//                              strip badge sets this, same interaction as clicking a histogram bar
+//                              sets level_min/level_max
+//   ?histogram=1&...       -> Skills page's level histogram, via skill_level_histogram RPC — also
+//                              respects `schedule_state` (only level itself is its own excluded axis)
+//   ?state_counts=1&...    -> Skills page's schedule-state summary strip (never/learning/
+//                              relearning/stable/retired counts), via skill_schedule_state_counts
+//                              RPC — same full filter set as ?browse=1 (including level), MINUS
+//                              schedule_state itself — same "exclude your own axis" reasoning as
+//                              the histogram excluding level, so every badge's count stays visible
+//                              for clicking regardless of which one is currently active
 //   ?history_for=id        -> every practice_attempt row for one skill, most recent first (row
 //                              expansion, plan.md §6) — the only path that returns `conversation`,
 //                              since list queries deliberately omit that large blob (plan.md §8)
@@ -58,8 +69,8 @@ export default async function handler(req, res) {
 
   const {
     project_id, card_ids, sort, limit = '20', offset = '0',
-    browse, histogram, history_for,
-    skill_type, level_min, level_max, state, kind, tags, q, sort_dir,
+    browse, histogram, state_counts, history_for,
+    skill_type, level_min, level_max, state, kind, tags, q, sort_dir, schedule_state,
   } = req.query
   if (!project_id) return res.status(400).json({ error: 'project_id required' })
 
@@ -101,9 +112,25 @@ export default async function handler(req, res) {
       p_kind: kind || null,
       p_tags: tags ? String(tags).split(',').filter(Boolean) : null,
       p_search: q || null,
+      p_schedule_state: schedule_state || null,
     })
     if (error) return res.status(500).json({ error: error.message })
     return res.status(200).json({ histogram: data.map(r => ({ level: r.level, count: Number(r.count) })) })
+  }
+
+  if (state_counts) {
+    const { data, error } = await supabase.rpc('skill_schedule_state_counts', {
+      p_project_id: project_id,
+      p_skill_type: skill_type || null,
+      p_level_min: level_min ? Number(level_min) : null,
+      p_level_max: level_max ? Number(level_max) : null,
+      p_states: state ? String(state).split(',').filter(Boolean) : null,
+      p_kind: kind || null,
+      p_tags: tags ? String(tags).split(',').filter(Boolean) : null,
+      p_search: q || null,
+    })
+    if (error) return res.status(500).json({ error: error.message })
+    return res.status(200).json({ counts: data.map(r => ({ state: r.schedule_state, count: Number(r.count) })) })
   }
 
   if (browse) {
@@ -124,6 +151,7 @@ export default async function handler(req, res) {
       p_sort_dir: sort_dir || 'asc',
       p_limit: Number(limit),
       p_offset: Number(offset),
+      p_schedule_state: schedule_state || null,
     })
     if (error) return res.status(500).json({ error: error.message })
     const total = data[0]?.total_count ?? 0
@@ -144,7 +172,7 @@ export default async function handler(req, res) {
     const [{ data, error, count }, { data: lastAttempts, error: lastAttemptsErr }] = await Promise.all([
       supabase
         .from('knowledge_cards')
-        .select('id, name, kind, tags, details, importance, skill(id, type, sense_type, level, importance, last_correct, state, interval_days, due_at, consecutive_correct)', { count: 'exact' })
+        .select('id, name, kind, tags, details, importance, skill(id, type, sense_type, level, importance, last_correct, state, interval_days, due_at)', { count: 'exact' })
         .eq('project_id', project_id),
       supabase.rpc('skill_last_attempt', { p_project_id: project_id }),
     ])

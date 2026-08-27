@@ -149,7 +149,7 @@ export default function App() {
   }
 
   // Reveals chat: already visible in Learn; opens the drawer everywhere else. Used by Practice's
-  // Explain/Why? buttons, the chat FAB, and every panel's "add to chat" action.
+  // Ask button, the chat FAB, and every panel's "add to chat" action.
   function revealChat(text) {
     if (mode !== 'learn') setDrawerOpen(true)
     if (text) {
@@ -293,6 +293,7 @@ export default function App() {
               onAppendToChat={revealChat}
               onSelectTag={openPeekTag}
               onSelectSource={handleOpenSourceInLibrary}
+              onSelectCard={openPeekCard}
               highlightSkillType={peek.highlightSkillType}
               tagCatalog={tagCatalog}
               onNewTags={refreshTagCatalog}

@@ -2,6 +2,8 @@ import { useState, useEffect, forwardRef, useImperativeHandle } from 'react'
 import { speak } from '../tts.js'
 import GermanText from './GermanText.jsx'
 import AnnotatedSpanEditor from './AnnotatedSpanEditor.jsx'
+import { CardSearchBar } from './CardSearchBar.jsx'
+import { RelateToControl } from './RelateToControl.jsx'
 import { useProject } from '../ProjectContext.jsx'
 import { getProjectConfig } from '../../lib/projectConfig.js'
 import { stripMarkers, applyMarkers } from '../../lib/annotationMarkers.js'
@@ -12,7 +14,54 @@ const TABLE_LABELS = {
   knowledge_card: 'Knowledge Card',
 }
 
-const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState = { status: 'idle' }, blocked = false, validationWarnings = [], unknownFields = [], contexts, forcedContext = null, sourceText, tagCatalog = [], proposedTagMeta = {}, onAddNewTag, linkState, onLink, annotatedSentence, onAnnotatedSentenceChange }, ref) {
+// "Relate to…" for a brand-new proposed card, BEFORE it's saved (plan.md — "Card Groups"): the
+// card has no id yet, so unlike RelateToControl.jsx's existing-card version this only ever STAGES
+// picks — actual group creation happens after the real save (ChatMessage.jsx's handleSave, once it
+// has the new card's id). A freshly created card can't already be in a group, so there's no
+// 0/1/many ambiguity to resolve here — every pick just accumulates into one eventual
+// `member_card_ids` list, same shape as CardsPanel's "Group these". Once the card IS saved, the
+// main SaveCard component below switches to RelateToControl instead (same immediate-resolution
+// behavior LinkCard.jsx uses for an already-existing card) — see its `isSaved` branch.
+function RelateToStaged({ activeProject, targets, onChange }) {
+  const [open, setOpen] = useState(false)
+
+  function remove(id) {
+    onChange(targets.filter(t => t.id !== id))
+  }
+  function add(card) {
+    if (targets.some(t => t.id === card.id)) return
+    onChange([...targets, card])
+  }
+
+  return (
+    <div className="text-xs space-y-1">
+      <div className="flex items-center justify-between">
+        <span className="text-gray-500">Relate to</span>
+        <button type="button" onClick={() => setOpen(v => !v)} className="text-purple-600 hover:text-purple-800 font-medium">
+          {open ? 'Done' : '+ Add'}
+        </button>
+      </div>
+      {targets.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {targets.map(t => (
+            <span key={t.id} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-purple-100 text-purple-700">
+              {t.name}
+              <button type="button" onClick={() => remove(t.id)} className="leading-none text-purple-400 hover:text-red-500">×</button>
+            </span>
+          ))}
+        </div>
+      )}
+      {open && (
+        <CardSearchBar activeProject={activeProject} excludeIds={targets.map(t => t.id)} onSelect={add} placeholder="Search for a card to relate…" autoFocus />
+      )}
+      {targets.length > 0 && (
+        <p className="text-[10px] text-gray-400">Related once this card is saved.</p>
+      )}
+    </div>
+  )
+}
+
+const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState = { status: 'idle' }, blocked = false, validationWarnings = [], unknownFields = [], contexts, forcedContext = null, sourceText, tagCatalog = [], proposedTagMeta = {}, onAddNewTag, linkState, onLink, annotatedSentence, onAnnotatedSentenceChange, relateTargets, onRelateTargetsChange, relateState }, ref) {
   const { activeProject } = useProject()
   const { ttsLocale, contextsRequired } = getProjectConfig(activeProject ?? {})
   const [fields, setFields] = useState(() => {
@@ -234,6 +283,25 @@ const SaveCard = forwardRef(function SaveCard({ table, record, onSave, saveState
 
       {status === 'error' && (
         <p className="text-xs text-red-500">{error}</p>
+      )}
+
+      {table === 'knowledge_card' && onRelateTargetsChange && (
+        isSaved ? (
+          <div className="space-y-1">
+            {/* Feedback from any relate(s) staged before saving (see RelateToStaged below) — the
+                actual API calls only fire once ChatMessage.jsx's handleSave has a real card id. */}
+            {relateState?.status === 'relating' && <p className="text-[10px] text-gray-400">Relating…</p>}
+            {relateState?.status === 'done' && <p className="text-[10px] text-green-600">Related.</p>}
+            {relateState?.status === 'error' && <p className="text-[10px] text-red-500">{relateState.error}</p>}
+            <RelateToControl activeProject={activeProject} cardId={saveState.id} cardName={fields.name} />
+          </div>
+        ) : (
+          <RelateToStaged
+            activeProject={activeProject}
+            targets={relateTargets ?? []}
+            onChange={onRelateTargetsChange}
+          />
+        )
       )}
 
       {Object.entries(fields).map(([key, value]) => {

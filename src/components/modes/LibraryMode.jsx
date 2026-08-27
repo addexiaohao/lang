@@ -7,6 +7,7 @@ import { CardDetailPanel } from '../panels/CardDetailPanel.jsx'
 import { TagsPanel } from '../panels/TagsPanel.jsx'
 import { ContextsPanel } from '../panels/ContextsPanel.jsx'
 import { SkillsPanel } from '../panels/SkillsPanel.jsx'
+import { GroupsPanel } from '../panels/GroupsPanel.jsx'
 
 // The existing multi-panel workspace (plan.md: "unchanged"), extracted verbatim out of App.jsx.
 // `layout` ({ openPanels, panelWidths }) and the four selection values are controlled from
@@ -20,6 +21,7 @@ export const LIBRARY_DEFAULT_WIDTHS = {
   tags: 340,
   contexts: 340,
   skills: 420,
+  groups: 340,
 }
 const MIN_WIDTH = 100
 
@@ -43,6 +45,15 @@ const LIBRARY_TABS = [
     icon: (
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
         <path d="M12 20V10M18 20V4M6 20v-4" />
+      </svg>
+    ),
+  },
+  {
+    id: 'groups',
+    label: 'Groups',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
+        <circle cx="8" cy="8" r="4" /><circle cx="16" cy="16" r="4" /><path d="M11 11l2 2" />
       </svg>
     ),
   },
@@ -294,6 +305,7 @@ export function LibraryMode({
             onDragStart={onDragStart}
             onSelectTag={handleSelectTag}
             onSelectSource={handleSelectSource}
+            onSelectCard={handleSelectCard}
             tagCatalog={tagCatalog}
             onNewTags={onNewTags}
           />
@@ -303,6 +315,15 @@ export function LibraryMode({
           <SkillsPanel
             activeProject={activeProject}
             tagCatalog={tagCatalog}
+            onSelectCard={handleSelectCard}
+            onDragStart={onDragStart}
+            onClose={onClose}
+          />
+        )
+      case 'groups':
+        return (
+          <GroupsPanel
+            activeProject={activeProject}
             onSelectCard={handleSelectCard}
             onDragStart={onDragStart}
             onClose={onClose}

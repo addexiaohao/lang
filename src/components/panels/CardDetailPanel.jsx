@@ -3,6 +3,9 @@ import { apiFetch } from '../../apiFetch.js'
 import { speak } from '../../tts.js'
 import { SKILL_TYPES, axisValueKey, axisValueGloss, axisValueExample, isSenseAxis, hasSenseAxis } from '../../../lib/skillTypes.js'
 import AddSenseForm from '../AddSenseForm.jsx'
+import GermanText from '../GermanText.jsx'
+import { CardSearchBar } from '../CardSearchBar.jsx'
+import { relateCard, createCardGroup, addCardToGroup, groupDisplayName } from '../../cardGroupActions.js'
 
 function HighlightedText({ text, positions = [] }) {
   if (!positions.length) return <>{text}</>
@@ -461,6 +464,265 @@ function SenseSkillList({ axes, skillRows, onSetLevel, onSetImportance, onRefine
   )
 }
 
+// Card Groups (plan.md) — "Relate this card…" + the group(s) this card belongs to, each with its
+// shared note, its other members (each with their own distinguishing note), and inline management
+// (rename, edit notes, remove a member). Resolution when relating (plan.md §2): the source card is
+// in no group -> create one with both; in exactly one -> add the target to it; in several -> the
+// user picks which one (or creates a new one) via `pendingTarget`'s inline chooser. Deleting the
+// whole group is deliberately NOT offered here — that's the Groups panel/group tab's job.
+function CardGroupsSection({ card, activeProject, groups, loadingGroups, onRefetch, onSelectCard }) {
+  const [showRelate, setShowRelate] = useState(false)
+  const [pendingTarget, setPendingTarget] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+  const [editingGroupId, setEditingGroupId] = useState(null)
+  const [nameDraft, setNameDraft] = useState('')
+  const [noteDraft, setNoteDraft] = useState('')
+  const [editingMemberKey, setEditingMemberKey] = useState(null)
+  const [memberNoteDraft, setMemberNoteDraft] = useState('')
+
+  // relateTo/confirmGroupChoice implement plan.md §2's resolution rule via the shared
+  // cardGroupActions helpers (also used by SaveCard.jsx/LinkCard.jsx's "Relate to…" on a
+  // just-proposed card) — relateCard() handles the unambiguous 0/1-group cases itself and hands
+  // back `{ resolved: false, groups }` when there's more than one, which is what pendingTarget's
+  // inline chooser below resolves.
+  async function relateTo(targetCard) {
+    setError(null)
+    setBusy(true)
+    try {
+      const result = await relateCard(activeProject.id, card.id, targetCard.id)
+      if (result.resolved) {
+        setShowRelate(false)
+        onRefetch()
+      } else {
+        setPendingTarget(targetCard)
+      }
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function confirmGroupChoice(groupId) {
+    if (!pendingTarget) return
+    setBusy(true)
+    setError(null)
+    try {
+      if (groupId === 'new') await createCardGroup(activeProject.id, [card.id, pendingTarget.id])
+      else await addCardToGroup(activeProject.id, groupId, pendingTarget.id)
+      setPendingTarget(null)
+      setShowRelate(false)
+      onRefetch()
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removeMember(groupId, memberCardId) {
+    setBusy(true)
+    setError(null)
+    try {
+      const r = await apiFetch(`/api/card-group-members?${new URLSearchParams({ project_id: activeProject.id, group_id: groupId, card_id: memberCardId })}`, { method: 'DELETE' })
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText)
+      onRefetch()
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  function startEditGroup(group) {
+    setEditingGroupId(group.id)
+    setNameDraft(group.name ?? '')
+    setNoteDraft(group.note ?? '')
+  }
+
+  async function saveGroupEdit(groupId) {
+    setBusy(true)
+    setError(null)
+    try {
+      const r = await apiFetch(`/api/card-groups?id=${groupId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name: nameDraft, note: noteDraft }),
+      })
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText)
+      setEditingGroupId(null)
+      onRefetch()
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function saveMemberNote(groupId, memberCardId) {
+    setBusy(true)
+    setError(null)
+    try {
+      const r = await apiFetch('/api/card-group-members', {
+        method: 'PATCH',
+        body: JSON.stringify({ project_id: activeProject.id, group_id: groupId, card_id: memberCardId, note: memberNoteDraft }),
+      })
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText)
+      setEditingMemberKey(null)
+      onRefetch()
+    } catch (e) {
+      setError(String(e.message || e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide">Groups</p>
+        {!showRelate && (
+          <button type="button" onClick={() => { setShowRelate(true); setError(null) }} className="text-[10px] text-purple-500 hover:text-purple-700 font-medium">
+            Relate this card…
+          </button>
+        )}
+      </div>
+
+      {showRelate && (
+        <div className="mb-3 space-y-1.5">
+          <CardSearchBar
+            activeProject={activeProject}
+            excludeIds={[card.id, ...groups.flatMap(g => g.members.map(m => m.card_id))]}
+            onSelect={relateTo}
+            placeholder="Search for a card to relate…"
+            autoFocus
+          />
+          {pendingTarget && (
+            <div className="border border-purple-200 bg-purple-50 rounded-lg p-2 space-y-1">
+              <p className="text-[10px] text-gray-600">"{card.name}" is in several groups — add "{pendingTarget.name}" to which one?</p>
+              {groups.map(g => (
+                <button
+                  key={g.id}
+                  type="button"
+                  onClick={() => confirmGroupChoice(g.id)}
+                  disabled={busy}
+                  className="w-full text-left text-[10px] px-2 py-1 rounded bg-white border border-gray-200 hover:border-purple-300 transition-colors disabled:opacity-50"
+                >
+                  {groupDisplayName(g)}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => confirmGroupChoice('new')}
+                disabled={busy}
+                className="w-full text-left text-[10px] px-2 py-1 rounded bg-white border border-gray-200 hover:border-purple-300 transition-colors disabled:opacity-50"
+              >
+                + Create a new group
+              </button>
+              <button type="button" onClick={() => setPendingTarget(null)} className="text-[10px] text-gray-400 hover:text-gray-600">Cancel</button>
+            </div>
+          )}
+          <button type="button" onClick={() => { setShowRelate(false); setPendingTarget(null); setError(null) }} className="text-[10px] text-gray-400 hover:text-gray-600">
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {error && <p className="text-[10px] text-red-500 mb-2">{error}</p>}
+      {loadingGroups && <p className="text-[10px] text-gray-400">Loading…</p>}
+      {!loadingGroups && groups.length === 0 && !showRelate && (
+        <p className="text-[10px] text-gray-400">Not related to any other card yet.</p>
+      )}
+
+      <div className="space-y-2">
+        {groups.map(group => {
+          const others = group.members.filter(m => m.card_id !== card.id)
+          const isEditing = editingGroupId === group.id
+          return (
+            <div key={group.id} className="border border-gray-200 rounded-lg p-2 bg-white">
+              {isEditing ? (
+                <div className="space-y-1.5">
+                  <input
+                    className="w-full text-xs border border-gray-200 rounded px-1.5 py-1 focus:outline-none focus:ring-1 focus:ring-purple-400"
+                    placeholder="Group name (optional)"
+                    value={nameDraft}
+                    onChange={e => setNameDraft(e.target.value)}
+                  />
+                  <textarea
+                    rows={2}
+                    className="w-full text-xs border border-gray-200 rounded px-1.5 py-1 resize-y focus:outline-none focus:ring-1 focus:ring-purple-400"
+                    placeholder="Shared axis of comparison (optional)"
+                    value={noteDraft}
+                    onChange={e => setNoteDraft(e.target.value)}
+                  />
+                  <div className="flex gap-1.5">
+                    <button type="button" onClick={() => saveGroupEdit(group.id)} disabled={busy} className="text-[10px] px-2 py-0.5 rounded bg-purple-500 text-white hover:bg-purple-600 disabled:opacity-50">Save</button>
+                    <button type="button" onClick={() => setEditingGroupId(null)} className="text-[10px] px-2 py-0.5 rounded border border-gray-200 text-gray-500 hover:bg-gray-50">Cancel</button>
+                  </div>
+                </div>
+              ) : (
+                <button type="button" onClick={() => startEditGroup(group)} className="text-xs font-semibold text-gray-700 hover:text-purple-600 text-left transition-colors block mb-1">
+                  {groupDisplayName(group)}
+                </button>
+              )}
+              {!isEditing && group.note && <p className="text-[11px] text-gray-500 italic mb-1.5">{group.note}</p>}
+              <div className="space-y-1">
+                {others.map(member => {
+                  const memberKey = `${group.id}:${member.card_id}`
+                  const isEditingMember = editingMemberKey === memberKey
+                  return (
+                    <div key={member.card_id} className="flex items-start gap-1.5 text-[11px]">
+                      {onSelectCard ? (
+                        <button type="button" onClick={() => onSelectCard({ id: member.card_id, name: member.name, kind: member.kind })} className="font-medium text-gray-700 hover:text-purple-600 shrink-0 transition-colors">
+                          {member.name}
+                        </button>
+                      ) : (
+                        <span className="font-medium text-gray-700 shrink-0">{member.name}</span>
+                      )}
+                      {isEditingMember ? (
+                        <div className="flex-1 flex items-start gap-1">
+                          <textarea
+                            autoFocus
+                            rows={1}
+                            className="flex-1 text-[11px] border border-gray-200 rounded px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-purple-400 resize-y"
+                            value={memberNoteDraft}
+                            onChange={e => setMemberNoteDraft(e.target.value)}
+                          />
+                          <button type="button" onClick={() => saveMemberNote(group.id, member.card_id)} disabled={busy} className="text-[10px] text-purple-500 hover:text-purple-700 shrink-0">Save</button>
+                          <button type="button" onClick={() => setEditingMemberKey(null)} className="text-[10px] text-gray-400 hover:text-gray-600 shrink-0">Cancel</button>
+                        </div>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => { setEditingMemberKey(memberKey); setMemberNoteDraft(member.note ?? '') }}
+                            className="text-gray-400 italic flex-1 text-left hover:text-gray-600 transition-colors truncate"
+                          >
+                            {member.note || 'add a note…'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => removeMember(group.id, member.card_id)}
+                            disabled={busy}
+                            title="Remove from this group"
+                            className="text-gray-300 hover:text-red-500 disabled:cursor-wait shrink-0"
+                          >
+                            ×
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
 // `prefetchedDetail`, when given and matching `card.id`, is used in place of the panel's own
 // fetch — lets a caller (Practice's docked card panel) kick the request off earlier than mount,
 // so the panel renders with no loading flicker once shown. `levelChange` ({ type, delta } | null,
@@ -469,7 +731,7 @@ function SenseSkillList({ axes, skillRows, onSetLevel, onSetImportance, onRefine
 // "other vocabulary already known" pool offered to the model for the current item vs. what it
 // reports actually weaving in (lib/prompts/registry.js's seedSection, api/practice.js) — rendered
 // as a "Suggested vocabulary" section alongside the skill tested.
-export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRenamed, onAppendToChat, onDragStart, onSelectTag, onSelectSource, highlightSkillType, prefetchedDetail, levelChange, seedInfo, tagCatalog = [], onNewTags }) {
+export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRenamed, onAppendToChat, onDragStart, onSelectTag, onSelectSource, onSelectCard, highlightSkillType, prefetchedDetail, levelChange, seedInfo, tagCatalog = [], onNewTags }) {
   const [detail, setDetail] = useState(prefetchedDetail?.id === card?.id ? prefetchedDetail : null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
@@ -487,6 +749,8 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
   const [savingTags, setSavingTags] = useState(false)
   const [showTagPicker, setShowTagPicker] = useState(false)
   const [tagSearch, setTagSearch] = useState('')
+  const [groups, setGroups] = useState([])
+  const [loadingGroups, setLoadingGroups] = useState(false)
 
   useEffect(() => {
     setConfirmingDelete(false)
@@ -496,6 +760,22 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
     setTagSearch('')
     setShowAddSense(false)
   }, [card?.id])
+
+  // Card Groups (plan.md) — every group this card belongs to, refetched on card change and after
+  // any membership/note mutation (see CardGroupsSection's onRefetch).
+  function refetchGroups() {
+    if (!card || !activeProject) return
+    setLoadingGroups(true)
+    apiFetch(`/api/card-groups?${new URLSearchParams({ project_id: activeProject.id, card_id: card.id })}`)
+      .then(r => r.ok ? r.json() : { groups: [] })
+      .then(data => setGroups(data.groups ?? []))
+      .catch(() => setGroups([]))
+      .finally(() => setLoadingGroups(false))
+  }
+  useEffect(() => {
+    refetchGroups()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [card?.id, activeProject?.id])
 
   useEffect(() => {
     if (!card || !activeProject) return
@@ -800,13 +1080,13 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
                   {nameError && <p className="text-[10px] text-red-500 mt-0.5">{nameError}</p>}
                 </div>
               ) : (
-                <button
-                  onClick={startEditingName}
-                  title="Click to rename"
-                  className="text-sm font-semibold text-gray-900 flex-1 leading-snug text-left hover:bg-gray-50 rounded px-0.5 -mx-0.5 transition-colors"
+                <div
+                  onDoubleClick={startEditingName}
+                  title="Double-click to rename"
+                  className="text-sm font-semibold text-gray-900 flex-1 leading-snug hover:bg-gray-50 rounded px-0.5 -mx-0.5 transition-colors"
                 >
-                  {card.name}
-                </button>
+                  <GermanText>{card.name}</GermanText>
+                </div>
               )}
               <span className={`text-[10px] rounded px-1.5 py-0.5 font-medium shrink-0 ${KIND_COLORS[card.kind] ?? 'bg-gray-100 text-gray-600'}`}>
                 {card.kind}
@@ -933,6 +1213,16 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
               )}
             </div>
           )}
+
+          {/* Card Groups */}
+          <CardGroupsSection
+            card={card}
+            activeProject={activeProject}
+            groups={groups}
+            loadingGroups={loadingGroups}
+            onRefetch={refetchGroups}
+            onSelectCard={onSelectCard}
+          />
 
           {/* Recent practice history for the just-practiced skill (Practice mode's docked card
               panel always passes highlightSkillType; elsewhere — Library, the peek overlay — no

@@ -2,9 +2,12 @@ import { forwardRef, useImperativeHandle, useState } from 'react'
 import { HighlightedText } from './HighlightedText.jsx'
 import AnnotatedSpanEditor from './AnnotatedSpanEditor.jsx'
 import SenseSelector from './SenseSelector.jsx'
+import { RelateToControl } from './RelateToControl.jsx'
+import { useProject } from '../ProjectContext.jsx'
 import { stripMarkers, applyMarkers } from '../../lib/annotationMarkers.js'
 
 const LinkCard = forwardRef(function LinkCard({ record, linkState = { status: 'idle' }, onLink, existingId, senseProposal, sourceId, annotatedSentence, onAnnotatedSentenceChange }, ref) {
+  const { activeProject } = useProject()
   // undefined = an incomplete "new sense" form (SenseSelector reports this to disable Link, not to
   // omit sense fields — distinct from null, "plain link, no sense fields needed").
   const [senseFields, setSenseFields] = useState(null)
@@ -73,6 +76,8 @@ const LinkCard = forwardRef(function LinkCard({ record, linkState = { status: 'i
           </div>
         )}
       </div>
+
+      <RelateToControl activeProject={activeProject} cardId={existingId} cardName={record.name} />
 
       <SenseSelector existingId={existingId} kind={record.kind} proposal={senseProposal} onChange={setSenseFields} />
 

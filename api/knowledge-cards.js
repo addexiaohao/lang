@@ -166,7 +166,7 @@ export default async function handler(req, res) {
       if (isPracticeResult) {
         const { data: existing } = await supabase
           .from('skill')
-          .select('level, state, interval_days, consecutive_correct, stable_interval_days')
+          .select('level, state')
           .eq('card_id', id)
           .eq('type', dbType)
           .eq('sense_type', dbSenseType)
@@ -185,7 +185,7 @@ export default async function handler(req, res) {
         const { data, error } = await supabase
           .from('skill')
           .upsert(row, { onConflict: 'card_id,type,sense_type' })
-          .select('id, type, sense_type, level, importance, hand_set, last_correct, state, interval_days, due_at, consecutive_correct')
+          .select('id, type, sense_type, level, importance, hand_set, last_correct, state, interval_days, due_at')
           .single()
 
         if (error) return res.status(500).json({ error: error.message })
@@ -225,7 +225,7 @@ export default async function handler(req, res) {
       const { data, error } = await supabase
         .from('skill')
         .upsert(row, { onConflict: 'card_id,type,sense_type' })
-        .select('id, type, sense_type, level, importance, hand_set, last_correct, state, interval_days, due_at, consecutive_correct')
+        .select('id, type, sense_type, level, importance, hand_set, last_correct, state, interval_days, due_at')
         .single()
 
       if (error) return res.status(500).json({ error: error.message })
@@ -269,7 +269,7 @@ export default async function handler(req, res) {
       .from('knowledge_cards')
       .select(`
         id, name, kind, tags, importance, details, created_at,
-        skill(id, type, sense_type, level, importance, hand_set, last_correct, state, interval_days, due_at, consecutive_correct),
+        skill(id, type, sense_type, level, importance, hand_set, last_correct, state, interval_days, due_at),
         source_knowledge(
           source_id,
           positions,
@@ -317,10 +317,11 @@ export default async function handler(req, res) {
   if (error) return res.status(500).json({ error: error.message })
 
   const total = data[0]?.total_count ?? 0
-  const cards = data.map(({ total_count, card_id, mean_level, ...row }) => ({
+  const cards = data.map(({ total_count, card_id, mean_level, group_count, ...row }) => ({
     ...row,
     id: card_id,
     mean_level: mean_level != null ? Number(mean_level) : null,
+    group_count: group_count != null ? Number(group_count) : 0,
   }))
   return res.status(200).json({ cards, total: Number(total) })
 }

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import GermanText from './GermanText.jsx'
+import AddNoteButton from './AddNoteButton.jsx'
 
 // Exemplar feed exercise body. `item` is a practice.exemplar response: { sentence, target_span, translation }.
 // Two outcomes: "Got it" (understanding counts as correct, fires onAnswered(true)) or "Don't
@@ -9,7 +10,7 @@ import GermanText from './GermanText.jsx'
 // prefetch/generation) but currently has no button calling it here — kept in place as a plain
 // re-roll for a future use. `onEasierSentence` (TODO.md's "Make sentences easier") is the separate
 // mechanism actually driving easier-vocabulary regeneration, shared with mc_cloze/spelling.
-export default function PracticeExemplar({ item, onAnswered, onNext, onNochEinSatz, onExplain, onAddSource, addSourceDisabled, onEasierSentence, easierCount = 0, maxEasierAttempts = 0 }) {
+export default function PracticeExemplar({ item, onAnswered, onNext, onNochEinSatz, onExplain, onAddSource, addSourceDisabled, onEasierSentence, easierCount = 0, maxEasierAttempts = 0, onAddNote }) {
   const [showTranslation, setShowTranslation] = useState(false)
   const [answered, setAnswered] = useState(false)
   useEffect(() => { setShowTranslation(false); setAnswered(false) }, [item])
@@ -51,7 +52,7 @@ export default function PracticeExemplar({ item, onAnswered, onNext, onNochEinSa
             onClick={onExplain}
             className="text-xs text-gray-400 hover:text-gray-600 transition-colors"
           >
-            Explain
+            Ask
           </button>
           <button
             onClick={() => setShowTranslation(v => !v)}
@@ -75,6 +76,7 @@ export default function PracticeExemplar({ item, onAnswered, onNext, onNochEinSa
               Easier sentence
             </button>
           )}
+          {onAddNote && <AddNoteButton onSave={onAddNote} />}
         </div>
         <div className="flex gap-2 ml-auto shrink-0">
           {!answered && (

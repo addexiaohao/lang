@@ -4,6 +4,7 @@ import { speak } from '../../tts.js'
 import { HighlightedText } from '../HighlightedText.jsx'
 import { isIndexInRanges } from '../../highlightText.js'
 import AnnotatedSpanEditor from '../AnnotatedSpanEditor.jsx'
+import GermanText from '../GermanText.jsx'
 
 function formatDate(iso) {
   return new Date(iso).toLocaleString(undefined, {
@@ -215,7 +216,9 @@ export function SourceDetailPanel({ source, activeProject, onClose, onAppendToCh
                         }`}
                       >
                         <div className="flex items-start justify-between gap-2">
-                          <span className="text-sm font-medium text-gray-800">{card.name}</span>
+                          <span className="text-sm font-medium text-gray-800 truncate">
+                            <GermanText>{card.name}</GermanText>
+                          </span>
                           <span className={`text-[10px] rounded px-1.5 py-0.5 font-medium shrink-0 ${KIND_COLORS[card.kind] ?? 'bg-gray-100 text-gray-600'}`}>
                             {card.kind}
                           </span>

@@ -32,7 +32,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [finished, setFinished] = useState(false)
-  // Three independent docked side panels — the "Why?"/"Explain" thread, the "Add source" chat, and
+  // Three independent docked side panels — the "Ask" thread, the "Add source" chat, and
   // the card panel (auto-opened once the current item is answered) — can be open together, each
   // its own column (see render below).
   const [explain, setExplain] = useState(null) // { suggestion, context } | null
@@ -405,6 +405,28 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     setExplain({ suggestion, context })
   }
 
+  // "Add note" (AddNoteButton, dev/self-use scratch notes — see api/practice-note.js). Keyed off
+  // effectiveSkill/current.rawItem so a note always lands on the skill/question actually on
+  // screen, same reasoning as recordPracticeResult/logTooHard. Returns the fetch promise so
+  // AddNoteButton can show its own saving/error state.
+  async function handleAddNote(noteText) {
+    if (!current) return
+    const res = await apiFetch('/api/practice-note', {
+      method: 'POST',
+      body: JSON.stringify({
+        project_id: activeProject.id,
+        card_id: effectiveSkill.card.id,
+        skill_type: effectiveSkill.type,
+        question: current.rawItem,
+        note: noteText,
+      }),
+    })
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}))
+      throw new Error(body.error || 'Failed to save note')
+    }
+  }
+
   function handleAddSource() {
     if (!current) return
     // The Add-source chat never sees the multiple-choice question — just the complete sentence,
@@ -496,11 +518,11 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
               </div>
             </div>
           ) : current && current.mode === 'mc_cloze' ? (
-            <PracticeMcCloze item={current} onWeiter={advance} onAnswered={handleAnswered} onExplain={handleExplain} onAddSource={handleAddSource} addSourceDisabled={!generatedContext} onEasierSentence={handleEasierSentence} easierCount={easierCount} maxEasierAttempts={MAX_EASIER_SENTENCE_ATTEMPTS} />
+            <PracticeMcCloze item={current} onWeiter={advance} onAnswered={handleAnswered} onExplain={handleExplain} onAddSource={handleAddSource} addSourceDisabled={!generatedContext} onEasierSentence={handleEasierSentence} easierCount={easierCount} maxEasierAttempts={MAX_EASIER_SENTENCE_ATTEMPTS} onAddNote={handleAddNote} />
           ) : current && current.mode === 'spelling' ? (
-            <PracticeSpelling item={current} onWeiter={advance} onAnswered={handleAnswered} onExplain={handleExplain} onAddSource={handleAddSource} addSourceDisabled={!generatedContext} onEasierSentence={handleEasierSentence} easierCount={easierCount} maxEasierAttempts={MAX_EASIER_SENTENCE_ATTEMPTS} />
+            <PracticeSpelling item={current} onWeiter={advance} onAnswered={handleAnswered} onExplain={handleExplain} onAddSource={handleAddSource} addSourceDisabled={!generatedContext} onEasierSentence={handleEasierSentence} easierCount={easierCount} maxEasierAttempts={MAX_EASIER_SENTENCE_ATTEMPTS} onAddNote={handleAddNote} />
           ) : current && current.mode === 'exemplar' ? (
-            <PracticeExemplar item={current} onAnswered={handleAnswered} onNext={advance} onNochEinSatz={handleNochEinSatz} onExplain={handleExplain} onAddSource={handleAddSource} addSourceDisabled={!generatedContext} onEasierSentence={handleEasierSentence} easierCount={easierCount} maxEasierAttempts={MAX_EASIER_SENTENCE_ATTEMPTS} />
+            <PracticeExemplar item={current} onAnswered={handleAnswered} onNext={advance} onNochEinSatz={handleNochEinSatz} onExplain={handleExplain} onAddSource={handleAddSource} addSourceDisabled={!generatedContext} onEasierSentence={handleEasierSentence} easierCount={easierCount} maxEasierAttempts={MAX_EASIER_SENTENCE_ATTEMPTS} onAddNote={handleAddNote} />
           ) : null}
         </div>
       </div>

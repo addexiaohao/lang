@@ -1,10 +1,11 @@
 import { useState, useEffect } from 'react'
 import GermanText from './GermanText.jsx'
+import AddNoteButton from './AddNoteButton.jsx'
 
 // Spelling exercise body. `item` is a practice.spelling response: { sentence, answer, meaning, translation }.
 // No options — the learner types the exact answer (capitalization, umlauts, etc. all count), graded
 // after trimming leading/trailing whitespace only.
-export default function PracticeSpelling({ item, onWeiter, onAnswered, onExplain, onAddSource, addSourceDisabled, onEasierSentence, easierCount = 0, maxEasierAttempts = 0 }) {
+export default function PracticeSpelling({ item, onWeiter, onAnswered, onExplain, onAddSource, addSourceDisabled, onEasierSentence, easierCount = 0, maxEasierAttempts = 0, onAddNote }) {
   const [value, setValue] = useState('')
   const [revealed, setRevealed] = useState(false)
   const [dontKnow, setDontKnow] = useState(false)
@@ -96,7 +97,7 @@ export default function PracticeSpelling({ item, onWeiter, onAnswered, onExplain
             disabled={!revealed}
             className="text-xs text-gray-400 hover:text-gray-600 disabled:opacity-0 transition-opacity"
           >
-            Why?
+            Ask
           </button>
           <button
             onClick={() => setShowTranslation(v => !v)}
@@ -120,6 +121,7 @@ export default function PracticeSpelling({ item, onWeiter, onAnswered, onExplain
               Easier sentence
             </button>
           )}
+          {onAddNote && <AddNoteButton onSave={onAddNote} />}
         </div>
         <button
           onClick={onWeiter}

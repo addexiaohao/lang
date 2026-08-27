@@ -47,7 +47,10 @@ export default async function handler(req, res) {
   const excerpts = (links ?? []).map(l => l.sources?.original_text).filter(Boolean)
 
   try {
-    const suggestion = await suggestSense({ anthropic, card, excerpts, languageName: languageName(project?.tts_locale) })
+    const suggestion = await suggestSense({
+      anthropic, card, excerpts, languageName: languageName(project?.tts_locale),
+      projectId: project_id, userId: user.id, cardId: card_id,
+    })
     return res.status(200).json(suggestion)
   } catch (e) {
     return res.status(502).json({ error: e.message })
