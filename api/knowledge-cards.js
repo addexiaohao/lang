@@ -1,6 +1,7 @@
 import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
-import { validateSkillType, skillDbColumns, resolveSkillType, hasSenseAxis, deriveSkillImportance } from '../lib/skillTypes.js'
+import { skillDbColumns, resolveSkillType, hasSenseAxis } from '../lib/skillTypes.js'
+import { resolveLanguagePack } from '../lib/resolveLanguagePack.js'
 import { logPracticeAttempt } from '../lib/practiceAttempts.js'
 import { computeSchedule, scheduleForManualLevel, nextLevel as nextLevelFor, NEVER_SCHEDULE } from '../lib/practiceScheduling.js'
 
@@ -50,7 +51,12 @@ export default async function handler(req, res) {
   if (req.method === 'PATCH') {
     if (!id) return res.status(400).json({ error: 'id required' })
 
-    const { importance, name, tags, skill_type, level, practice_result, model, encounter_id, conversation, sense_key, sense_gloss, new_sense, existing_sense, link_existing_sources } = req.body ?? {}
+    const { importance, name, tags, skill_type, level, practice_result, model, encounter_id, conversation, sense_key, sense_gloss, new_sense, existing_sense, link_existing_sources, remove_sense } = req.body ?? {}
+
+    // The project's language pack — validates skill types and supplies default skill importance.
+    // Resolved once here for the sense (new_sense/existing_sense) and skill_type PATCH branches
+    // below; the importance/name/tags-only branch never touches it, but the extra fetch is cheap.
+    const pack = await resolveLanguagePack(project_id)
 
     // "Refine existing sense" (plan.md — "Word Senses" §3): correct a sense's gloss in place,
     // without forking a new sense — distinct from the skill_type branch below, since a gloss lives
@@ -63,6 +69,21 @@ export default async function handler(req, res) {
       const { data: owned } = await supabase.from('knowledge_cards').select('id').eq('id', id).eq('project_id', project_id).maybeSingle()
       if (!owned) return res.status(404).json({ error: 'Card not found' })
       const { data, error } = await supabase.rpc('update_sense_gloss', { p_card_id: id, p_key: sense_key, p_gloss: sense_gloss })
+      if (error) return res.status(400).json({ error: error.message })
+      return res.status(200).json(data)
+    }
+
+    // Remove a sense from a sense-split card — the one destructive sense mutation (every other one
+    // above is additive/in-place). Deletes the sense's own skill row via remove_sense_value, which
+    // cascades away its practice_attempt history and nulls out any source_knowledge.skill_id that
+    // pointed at it (see schema.sql). Refuses to remove the last remaining sense.
+    if (remove_sense !== undefined) {
+      if (typeof remove_sense !== 'string' || !remove_sense.trim()) {
+        return res.status(400).json({ error: 'remove_sense must be a non-empty string' })
+      }
+      const { data: owned } = await supabase.from('knowledge_cards').select('id').eq('id', id).eq('project_id', project_id).maybeSingle()
+      if (!owned) return res.status(404).json({ error: 'Card not found' })
+      const { data, error } = await supabase.rpc('remove_sense_value', { p_card_id: id, p_key: remove_sense })
       if (error) return res.status(400).json({ error: error.message })
       return res.status(200).json(data)
     }
@@ -86,7 +107,7 @@ export default async function handler(req, res) {
       if (cardErr || !card) return res.status(404).json({ error: 'Card not found' })
       if (card.kind !== 'vocabulary') return res.status(400).json({ error: 'Only vocabulary cards can have senses' })
 
-      const skillImportance = deriveSkillImportance(card.kind, 'meaning', card.importance)
+      const skillImportance = pack.skillImportance(card, 'meaning')
       const validSense = (s) => typeof s?.key === 'string' && s.key.trim() && typeof s?.gloss === 'string' && s.gloss.trim()
       let senseErr, senseData
 
@@ -150,7 +171,7 @@ export default async function handler(req, res) {
         .eq('id', id)
         .single()
       if (cardErr || !card) return res.status(404).json({ error: 'Card not found' })
-      if (!validateSkillType(card, skill_type)) {
+      if (!pack.validateSkillType(card, skill_type)) {
         return res.status(400).json({ error: `"${skill_type}" is not a valid skill type for this card` })
       }
       // A sense skill's DB row keeps type='meaning' and carries the sense in a separate `sense_type`
@@ -206,13 +227,14 @@ export default async function handler(req, res) {
       if (level !== undefined) {
         row.level = level
         row.hand_set = level !== null
-        // A bare level number, not an outcome — scheduleForManualLevel only reacts to the two
-        // edge transitions it forces regardless of history (retiring at level 10, clearing back to
-        // "never" at level null); any other hand-set level leaves the ladder untouched (see that
-        // function's comment in lib/practiceScheduling.js).
+        // Hand-setting a level moves the scheduling state by the DIRECTION of the change vs. the
+        // skill's previous level (higher -> 'stable', lower -> 'learning', unchanged -> keep), and
+        // always recomputes due_at/interval_days from the new level — plus the edge transitions a
+        // bare number forces regardless (level 10 retires, level null resets to "never"). Needs the
+        // previous level as well as state — see scheduleForManualLevel in lib/practiceScheduling.js.
         const { data: existingSchedule } = await supabase
           .from('skill')
-          .select('state')
+          .select('state, level')
           .eq('card_id', id)
           .eq('type', dbType)
           .eq('sense_type', dbSenseType)
@@ -221,6 +243,16 @@ export default async function handler(req, res) {
         if (scheduleUpdate) Object.assign(row, scheduleUpdate)
       }
       if (importance !== undefined) row.importance = importance
+      // Marking a skill unimportant (importance 0 — a deliberate state, not "unset") also takes it
+      // off the practice schedule entirely: level cleared to null, hand_set cleared, scheduling
+      // state reset to 'never' (no due_at/interval). Overrides anything the level block above set,
+      // on the rare PATCH that carries both. A card-wide importance-0 edit does the same to every
+      // skill on the card — see the card branch below.
+      if (importance === 0) {
+        row.level = null
+        row.hand_set = false
+        Object.assign(row, NEVER_SCHEDULE)
+      }
 
       const { data, error } = await supabase
         .from('skill')
@@ -260,6 +292,17 @@ export default async function handler(req, res) {
     if (error) {
       if (error.code === '23505') return res.status(409).json({ error: `A card named "${update.name}" already exists in this project` })
       return res.status(500).json({ error: error.message })
+    }
+
+    // Marking a card unimportant (importance 0) resets every skill on it to an unscheduled state:
+    // level cleared to null, hand_set cleared, scheduling state 'never' (no due_at/interval). The
+    // skills' own `importance` values are left untouched — only the card's was set here.
+    if (importance === 0) {
+      const { error: skillErr } = await supabase
+        .from('skill')
+        .update({ level: null, hand_set: false, ...NEVER_SCHEDULE })
+        .eq('card_id', id)
+      if (skillErr) return res.status(500).json({ error: skillErr.message })
     }
     return res.status(200).json(data)
   }

@@ -28,6 +28,16 @@ const MODE_ITEMS = [
       </svg>
     ),
   },
+  {
+    id: 'debug',
+    label: 'Debug',
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
+        <rect x="8" y="6" width="8" height="12" rx="4" />
+        <path d="M8 10H4M8 14H4M16 10h4M16 14h4M9 6l-2-2M15 6l2-2M12 6V4" />
+      </svg>
+    ),
+  },
 ]
 
 export function Sidebar({ mode, onModeChange, onOpenSettings, onLogout, header }) {

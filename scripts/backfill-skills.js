@@ -1,7 +1,7 @@
 // Standalone, repeatable backfill: walks existing knowledge_cards and (1) creates any missing flat
-// skill rows (level = null, never practiced) per lib/skillTypes.js's deriveFlatSkillTypes(), and (2) fills in
-// `importance` on existing flat skill rows that don't have one yet — both via
-// deriveSkillImportance(kind, type, card.importance). Rows that already carry a manually-set
+// skill rows (level = null, never practiced) per the project's resolved language pack
+// (pack.skillTypesForCard(card)), and (2) fills in `importance` on existing flat skill rows that
+// don't have one yet — both via pack.skillImportance(card, type). Rows that already carry a manually-set
 // importance are left untouched. Paradigm cards (details.axes present) are skipped — their cells
 // appear lazily, not via backfill.
 // Idempotent: upserts on (card_id, type) with ignoreDuplicates, safe to re-run on a
@@ -13,7 +13,7 @@ import { config } from 'dotenv'
 import { fileURLToPath } from 'url'
 import { dirname, resolve } from 'path'
 import { createClient } from '@supabase/supabase-js'
-import { deriveFlatSkillTypes, deriveSkillImportance } from '../lib/skillTypes.js'
+import { resolveLanguagePack } from '../lib/resolveLanguagePack.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 config({ path: resolve(__dirname, '../.env') })
@@ -30,6 +30,16 @@ const supabase = createClient(VITE_SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 const PAGE_SIZE = 500
 
+// Skill types + default importance are per-project now (lib/languagePack.js) — resolve each
+// project's pack once and reuse it across all its cards.
+const packCache = new Map()
+async function packFor(projectId) {
+  if (!packCache.has(projectId)) {
+    packCache.set(projectId, await resolveLanguagePack(projectId, { client: supabase }))
+  }
+  return packCache.get(projectId)
+}
+
 async function main() {
   let offset = 0
   let cardsVisited = 0
@@ -41,7 +51,7 @@ async function main() {
   while (true) {
     const { data: cards, error } = await supabase
       .from('knowledge_cards')
-      .select('id, kind, tags, details, importance')
+      .select('id, project_id, kind, tags, details, importance')
       .range(offset, offset + PAGE_SIZE - 1)
     if (error) {
       console.error('Failed to fetch knowledge_cards:', error.message)
@@ -75,7 +85,8 @@ async function main() {
       const axes = card.details?.axes
       if (Array.isArray(axes) && axes.length > 0) continue
 
-      const types = deriveFlatSkillTypes(card)
+      const pack = await packFor(card.project_id)
+      const types = pack.skillTypesForCard(card)
       const existing = existingByCard.get(card.id) ?? new Map()
       const missing = types.filter(t => !existing.has(t))
       skillsSkippedExisting += types.length - missing.length
@@ -87,7 +98,7 @@ async function main() {
             card_id: card.id,
             type,
             level: null,
-            importance: deriveSkillImportance(card.kind, type, card.importance),
+            importance: pack.skillImportance(card, type),
           })
         }
       }
@@ -98,7 +109,7 @@ async function main() {
         importanceBackfilled++
         toUpdateImportance.push({
           id: row.id,
-          importance: deriveSkillImportance(card.kind, type, card.importance),
+          importance: pack.skillImportance(card, type),
         })
       }
     }

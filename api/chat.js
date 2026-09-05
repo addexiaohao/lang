@@ -5,7 +5,8 @@ import { getProjectConfig } from '../lib/projectConfig.js'
 import { findDuplicateSource } from '../lib/normalizeSourceText.js'
 import { compose } from '../lib/prompts/registry.js'
 import { runChatLoop, CHAT_MODEL } from '../lib/chatLoop.js'
-import { isSenseExempt, hasSenseAxis, senseValues, axisValueKey, axisValueGloss, axisValueExample } from '../lib/skillTypes.js'
+import { hasSenseAxis, senseValues, axisValueKey, axisValueGloss, axisValueExample } from '../lib/skillTypes.js'
+import { resolveLanguagePack } from '../lib/resolveLanguagePack.js'
 import { getSenseVerdict } from '../lib/senseCheck.js'
 import { languageName } from '../lib/prompts/fragments.js'
 import { logLlmApiCall } from '../lib/llmUsageLog.js'
@@ -38,9 +39,10 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'messages array required' })
   }
 
-  const [{ data: project }, { data: tagsData }] = await Promise.all([
+  const [{ data: project }, { data: tagsData }, languagePack] = await Promise.all([
     supabase.from('projects').select('system_prompt, config, tts_locale, context_required').eq('id', project_id).single(),
     supabase.from('tags').select('name').eq('project_id', project_id).order('name'),
+    resolveLanguagePack(project_id),
   ])
   const tags = tagsData ?? []
 
@@ -69,7 +71,7 @@ export default async function handler(req, res) {
   // that already have a non-sense axis (declension paradigms — sense-splitting doesn't apply) never
   // hit the checker at all.
   async function attachSenseInfo(card, excerpt) {
-    if (card.kind !== 'vocabulary' || !excerpt || isSenseExempt(card)) return card
+    if (card.kind !== 'vocabulary' || !excerpt || languagePack.isSenseExempt(card)) return card
     const axes = card.details?.axes
     if (Array.isArray(axes) && axes.length > 0 && !hasSenseAxis(card)) return card // non-sense paradigm card
 

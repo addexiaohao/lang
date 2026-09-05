@@ -91,6 +91,57 @@ create table if not exists skill (
   unique (card_id, type)
 );
 
+-- ── LANGUAGE PACKS (see plan-language-packs.md) ──────────────────────────────
+-- Per-project, user-authored config that used to be hardcoded German in lib/skillTypes.js
+-- (SKILL_TYPES / VOCAB_TAG_RULES / SKILL_GATES / DEFAULT_SKILL_IMPORTANCE / SENSE_EXEMPT_TAGS)
+-- and lib/practiceRules.js (SKILL_PROBLEM_TYPES). Core code stays language-agnostic and reads
+-- these rows via lib/languagePack.js's resolveLanguagePack(). SACRED — hand-authored, never in
+-- the --reset drop set. Seed an existing project from code with scripts/seed-language-pack.js so
+-- there's no behavior change on rollout.
+
+-- One row per assessable facet a card of a given kind can have (the thing that carries a level
+-- and a schedule). `key` is what lands in skill.type — immutable in the editor once any skill
+-- row uses it. applies_when decides which cards grow this skill row eagerly on save; null =
+-- every card of `kind`. Core always guarantees a vocabulary `meaning` type even with zero rows.
+create table if not exists skill_type_def (
+  id                 uuid primary key default gen_random_uuid(),
+  project_id         uuid not null references projects(id) on delete cascade,
+  key                text not null,
+  kind               text not null check (kind in ('vocabulary','grammar','expression')),
+  label              text not null,
+  applies_when       jsonb,   -- null = always; else { kind?, any_tag?:[], all_tags?:[], not?:{any_tag?,all_tags?} }
+  gate               jsonb,   -- null = ungated; else { requires:text, min_level:int, state:text }
+  importance_default jsonb not null default '"inherit"',  -- "inherit" | int 0-10
+  display_order      int not null default 0,
+  created_at         timestamptz not null default now(),
+  unique (project_id, kind, key)
+);
+
+-- One row per (skill type, question type[, card-tag condition]) — how a facet gets drilled.
+-- Replaces lib/practiceRules.js's SKILL_PROBLEM_TYPES. `prompt` is additive pedagogical prose
+-- (plain text, {cardName}/{cardStem} placeholders); the core PROBLEM_TYPES[qt].task() template
+-- still owns every FORMAT rule. weight_curve is a named curve, never user code. require_frame
+-- toggles the frame instruction + validator together (was 3 hardcoded tag checks). applies_when
+-- (tested against the card's tags) lets one (skill_type, question_type) carry several prompts;
+-- highest `priority` among matching rules wins.
+create table if not exists drill_rule (
+  id             uuid primary key default gen_random_uuid(),
+  project_id     uuid not null references projects(id) on delete cascade,
+  kind           text not null check (kind in ('vocabulary','grammar','expression')),
+  skill_type_key text not null,
+  question_type  text not null check (question_type in ('mc_cloze','spelling','exemplar','discrimination_cloze')),
+  applies_when   jsonb,
+  priority       int  not null default 0,
+  enabled        bool not null default true,
+  weight_curve   text not null default 'flat' check (weight_curve in ('flat','rising','falling')),
+  level_floor    smallint check (level_floor between 1 and 10),
+  level_ceiling  smallint check (level_ceiling between 1 and 10),
+  require_frame  bool not null default false,
+  prompt         text not null default '',
+  created_at     timestamptz not null default now()
+);
+create index if not exists drill_rule_lookup on drill_rule (project_id, kind, skill_type_key);
+
 -- Per-user settings: default project selection, etc.
 create table if not exists user_settings (
   user_id            uuid primary key references auth.users(id) on delete cascade,
@@ -151,7 +202,9 @@ create table if not exists practice_attempt (
 -- a bad-distractor entry just its pass confirmation (e.g. "Correct.", since the checker itself saw
 -- nothing wrong with it — that's exactly why it's flagged as too-fine-an-alternative rather than a
 -- broken sentence). `sentence`/`options`/`answer` are the generated item's own fields, kept for
--- context. See lib/mcClozeCheck.js's verifyMcClozeItem() for the exact derivation.
+-- context. `conversation` is the full { model, system, messages } generation request that produced
+-- the item (see the RETROACTIVE COLUMN ADDITIONS section). See lib/mcClozeCheck.js's
+-- verifyMcClozeItem() for the exact derivation.
 create table if not exists mc_cloze_check_failure (
   id                   uuid primary key default gen_random_uuid(),
   skill_id             uuid references skill(id) on delete cascade,  -- nullable: a substituted/never-assessed skill may not have a row yet
@@ -200,6 +253,8 @@ alter table user_settings          enable row level security;
 alter table skill                  enable row level security;
 alter table practice_attempt       enable row level security;
 alter table mc_cloze_check_failure enable row level security;
+alter table skill_type_def         enable row level security;
+alter table drill_rule             enable row level security;
 -- system_prompt_history RLS is enabled after the table is created below
 
 -- Remove old open-access policies
@@ -213,6 +268,8 @@ drop policy if exists "anon full access" on user_settings;
 drop policy if exists "anon full access" on skill;
 drop policy if exists "anon full access" on practice_attempt;
 drop policy if exists "anon full access" on mc_cloze_check_failure;
+drop policy if exists "anon full access" on skill_type_def;
+drop policy if exists "anon full access" on drill_rule;
 -- system_prompt_history drop policy is applied after the table is created below
 
 -- All data access goes through /api/* serverless functions using the service role key,
@@ -531,6 +588,13 @@ alter table skill add column if not exists state text not null default 'never'
 alter table skill add column if not exists interval_days smallint;
 alter table skill add column if not exists due_at timestamptz;
 
+-- The exact { model, system, messages } sent to Anthropic for the generation attempt that produced
+-- the flagged item — the same shape api/practice.js round-trips back to the client as `request`.
+-- Lets a failed answer-uniqueness check be traced back to the full prompt/conversation that made it,
+-- not just the item's own sentence/options. Nullable: older rows predate this, and a check can in
+-- principle fire before any onRequest (defensive).
+alter table mc_cloze_check_failure add column if not exists conversation jsonb;
+
 -- consecutive_correct/stable_interval_days: dropped. The old model needed them to remember a
 -- relearning streak count and the ladder rung a skill fell from; the state machine above replaced
 -- both (state itself encodes streak progress, and interval_days depends only on level), and no code
@@ -734,6 +798,51 @@ begin
   set details = jsonb_set(details, array['axes', '0', 'values', idx::text, 'gloss'], to_jsonb(p_gloss))
   where id = p_card_id
   returning * into updated_card;
+
+  return to_jsonb(updated_card);
+end;
+$$;
+
+-- Removes one sense value from a sense-split card — the one destructive exception among the sense
+-- mutations above (append_sense_value/update_sense_gloss are both additive; this actually deletes
+-- data). Deletes the sense's own `skill` row outright, which cascades away its practice_attempt
+-- history and, via source_knowledge.skill_id's `on delete set null` (see that column above), reverts
+-- any source link that pointed at this sense back to "no specific sense" rather than vanishing.
+-- Refuses to remove the LAST remaining value: a sense-split card must always keep at least one (a
+-- one-value sense axis is itself a legitimate end state — see migrate_card_to_senses above — but
+-- zero would leave a vocabulary card with no meaning skill at all).
+create or replace function remove_sense_value(
+  p_card_id uuid,
+  p_key text
+) returns jsonb language plpgsql as $$
+declare
+  updated_card knowledge_cards;
+  existing_values jsonb;
+  remaining_values jsonb;
+begin
+  select details->'axes'->0->'values' into existing_values
+  from knowledge_cards
+  where id = p_card_id and (details->'axes'->0->>'name') = 'sense';
+  if existing_values is null then
+    raise exception 'Card has no sense axis';
+  end if;
+  if not exists (select 1 from jsonb_array_elements(existing_values) v where v->>'key' = p_key) then
+    raise exception 'Sense key "%" not found', p_key;
+  end if;
+  if jsonb_array_length(existing_values) <= 1 then
+    raise exception 'Cannot remove the last remaining sense';
+  end if;
+
+  select jsonb_agg(v) into remaining_values
+  from jsonb_array_elements(existing_values) v
+  where v->>'key' <> p_key;
+
+  update knowledge_cards
+  set details = jsonb_set(details, '{axes,0,values}', remaining_values)
+  where id = p_card_id
+  returning * into updated_card;
+
+  delete from skill where card_id = p_card_id and type = 'meaning' and sense_type = p_key;
 
   return to_jsonb(updated_card);
 end;

@@ -1,7 +1,8 @@
 import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
 import { resolvePositions } from '../lib/resolvePositions.js'
-import { deriveFlatSkillTypes, deriveSkillImportance, hasSenseAxis } from '../lib/skillTypes.js'
+import { hasSenseAxis } from '../lib/skillTypes.js'
+import { resolveLanguagePack } from '../lib/resolveLanguagePack.js'
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -70,9 +71,10 @@ export default async function handler(req, res) {
     let skillId = null
     if (new_sense?.key) {
       // A sense skill's DB type stays 'meaning' (see lib/skillTypes.js) — its importance is derived
-      // under that same key, not the sense key itself, so it inherits whatever formula 'meaning'
-      // ends up tuned to rather than silently falling back to a bare cardImportance copy forever.
-      const importance = deriveSkillImportance(card.kind, 'meaning', card.importance)
+      // under that same key, not the sense key itself, so it inherits whatever the pack's 'meaning'
+      // importance_default is rather than silently falling back to a bare cardImportance copy.
+      const pack = await resolveLanguagePack(project_id)
+      const importance = pack.skillImportance(card, 'meaning')
       let senseErr, senseData
       if (hasSenseAxis(card)) {
         ;({ data: senseData, error: senseErr } = await supabase.rpc('append_sense_value', {
@@ -126,10 +128,12 @@ export default async function handler(req, res) {
     const card = { ...cardFields, project_id }
     const link = { source_id, positions }
     const axes = card.details?.axes
-    const skill_types = Array.isArray(axes) && axes.length > 0 ? [] : deriveFlatSkillTypes(card)
+    const isParadigm = Array.isArray(axes) && axes.length > 0
+    const pack = await resolveLanguagePack(project_id)
+    const skill_types = isParadigm ? [] : pack.skillTypesForCard(card)
     const skills = skill_types.map(type => ({
       type,
-      importance: deriveSkillImportance(card.kind, type, card.importance),
+      importance: pack.skillImportance(card, type),
     }))
     const { data, error } = await supabase.rpc('save_card_and_link', { card, link, skills })
     if (error) {

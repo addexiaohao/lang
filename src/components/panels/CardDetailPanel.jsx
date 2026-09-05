@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { apiFetch } from '../../apiFetch.js'
 import { speak } from '../../tts.js'
-import { SKILL_TYPES, axisValueKey, axisValueGloss, axisValueExample, isSenseAxis, hasSenseAxis } from '../../../lib/skillTypes.js'
+import { axisValueKey, axisValueGloss, axisValueExample, isSenseAxis, hasSenseAxis } from '../../../lib/skillTypes.js'
+import { useLanguagePack } from '../../LanguagePackContext.jsx'
 import AddSenseForm from '../AddSenseForm.jsx'
 import GermanText from '../GermanText.jsx'
 import { CardSearchBar } from '../CardSearchBar.jsx'
@@ -221,8 +222,9 @@ function LevelDelta({ delta }) {
 }
 
 function FlatSkillList({ kind, skillRows, onSetLevel, onSetImportance, savingType, highlightType, levelChange }) {
+  const pack = useLanguagePack()
   const byType = new Map(skillRows.map(s => [s.type, s]))
-  const order = SKILL_TYPES[kind] ?? []
+  const order = pack ? pack.skillTypeKeysForKind(kind) : []
   // Existing rows first (in registry order), then any row of a type not in the registry (shouldn't
   // normally happen, but don't silently drop it).
   const types = [...order.filter(t => byType.has(t)), ...skillRows.map(s => s.type).filter(t => !order.includes(t))]
@@ -378,24 +380,65 @@ function ParadigmSkillGrid({ axes, skillRows, onSetLevel, onSetImportance, savin
 // gloss behind a click and rendered a mystery second column for it. Every sense gets its own row
 // here instead: key, gloss, example, and Level/Importance dots all visible without selecting a cell
 // first — there's no grid structure to justify hiding them.
-function SenseSkillList({ axes, skillRows, onSetLevel, onSetImportance, onRefineGloss, savingType, highlightType, levelChange }) {
+function SenseSkillList({ axes, skillRows, onSetLevel, onSetImportance, onRefineGloss, onRemoveSense, savingType, highlightType, levelChange }) {
   const senseAxis = axes[0]
   const byType = new Map(skillRows.map(s => [s.type, s]))
   const [editingKey, setEditingKey] = useState(null)
   const [glossDraft, setGlossDraft] = useState('')
+  const [removingKey, setRemovingKey] = useState(null)
+  const values = senseAxis.values ?? []
+  // remove_sense_value (schema.sql) refuses to drop the last remaining sense — a sense-split card
+  // must always keep at least one — so the button itself doesn't render when there's only one left.
+  const canRemove = onRemoveSense && values.length > 1
 
   return (
     <div className="space-y-2">
-      {(senseAxis.values ?? []).map(v => {
+      {values.map(v => {
         const key = axisValueKey(v)
         const gloss = axisValueGloss(v)
         const example = axisValueExample(v)
         const skill = byType.get(key)
         const isEditing = editingKey === key
+        const isRemoving = removingKey === key
         return (
           <div key={key} className={`rounded-md border px-2 py-1.5 space-y-1.5 ${key === highlightType ? 'border-blue-300 bg-blue-50' : 'border-gray-200 bg-white'}`}>
+            {isRemoving && (
+              <div className="flex items-center gap-2 bg-red-50 border border-red-200 rounded px-2 py-1">
+                <span className="text-[10px] text-red-600 flex-1">
+                  Remove sense "{key}" and its practice history? This cannot be undone.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onRemoveSense(key)}
+                  disabled={savingType === key}
+                  className="text-[10px] font-medium text-white bg-red-600 hover:bg-red-700 disabled:opacity-60 rounded px-1.5 py-0.5 shrink-0"
+                >
+                  {savingType === key ? 'Removing…' : 'Confirm'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRemovingKey(null)}
+                  disabled={savingType === key}
+                  className="text-[10px] text-gray-500 hover:text-gray-700 disabled:opacity-60 shrink-0"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
             <div>
-              <span className="text-xs font-semibold text-gray-700">{key}</span>
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold text-gray-700 flex-1">{key}</span>
+                {canRemove && !isRemoving && (
+                  <button
+                    type="button"
+                    onClick={() => setRemovingKey(key)}
+                    title="Remove this sense"
+                    className="shrink-0 text-[10px] text-gray-400 hover:text-red-500 font-medium"
+                  >
+                    Remove
+                  </button>
+                )}
+              </div>
               {isEditing ? (
                 <div className="flex items-start gap-1.5 mt-1">
                   <textarea
@@ -727,10 +770,11 @@ function CardGroupsSection({ card, activeProject, groups, loadingGroups, onRefet
 // fetch — lets a caller (Practice's docked card panel) kick the request off earlier than mount,
 // so the panel renders with no loading flicker once shown. `levelChange` ({ type, delta } | null,
 // also Practice-only) renders a +N/-N badge next to that one skill's Level dots, right after a
-// practice attempt just moved it. `seedInfo` ({ offered, used } | null, also Practice-only) is the
-// "other vocabulary already known" pool offered to the model for the current item vs. what it
-// reports actually weaving in (lib/prompts/registry.js's seedSection, api/practice.js) — rendered
-// as a "Suggested vocabulary" section alongside the skill tested.
+// practice attempt just moved it. `seedInfo` ({ offered: [{id,name}], used: [name] } | null,
+// also Practice-only) is the "other vocabulary already known" pool offered to the model for the
+// current item vs. what it reports actually weaving in (lib/prompts/registry.js's seedSection,
+// api/practice.js) — rendered as a "Suggested vocabulary" section alongside the skill tested, each
+// entry a link (via `onSelectCard`) to its own card.
 export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRenamed, onAppendToChat, onDragStart, onSelectTag, onSelectSource, onSelectCard, highlightSkillType, prefetchedDetail, levelChange, seedInfo, tagCatalog = [], onNewTags }) {
   const [detail, setDetail] = useState(prefetchedDetail?.id === card?.id ? prefetchedDetail : null)
   const [loading, setLoading] = useState(false)
@@ -809,6 +853,9 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
       if (!r.ok) throw new Error(r.statusText)
       const updated = await r.json()
       setDetail(prev => prev ? { ...prev, importance: updated.importance } : prev)
+      // importance 0 also resets every skill on the card server-side (level -> null, state ->
+      // 'never') — the PATCH response only carries the card, so re-fetch to pull the reset skills.
+      if (value === 0) refetchDetail()
     } catch (e) {
       setError(String(e))
     } finally {
@@ -931,6 +978,30 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
       setDetail(prev => prev ? { ...prev, details: updated.details } : prev)
     } catch (e) {
       setError(String(e))
+    } finally {
+      setSavingSkillType(null)
+    }
+  }
+
+  // Remove a sense — the one destructive sense mutation (every other one is additive/in-place). The
+  // PATCH deletes the sense's own skill row server-side (cascading its practice history), so — same
+  // reasoning as adding a sense — refetch rather than hand-merge a partial shape.
+  async function removeSense(senseKey) {
+    if (!card || !activeProject) return
+    setSavingSkillType(senseKey)
+    try {
+      const r = await apiFetch(`/api/knowledge-cards?project_id=${activeProject.id}&id=${card.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ remove_sense: senseKey }),
+      })
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}))
+        throw new Error(body.error || r.statusText)
+      }
+      refetchDetail()
+    } catch (e) {
+      setError(String(e.message || e))
     } finally {
       setSavingSkillType(null)
     }
@@ -1205,7 +1276,7 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
                 </div>
               )}
               {axes && isSenseAxis(axes[0]) ? (
-                <SenseSkillList axes={axes} skillRows={detail.skill ?? []} onSetLevel={updateSkillLevel} onSetImportance={updateSkillImportance} onRefineGloss={refineSenseGloss} savingType={savingSkillType} highlightType={highlightSkillType} levelChange={levelChange} />
+                <SenseSkillList axes={axes} skillRows={detail.skill ?? []} onSetLevel={updateSkillLevel} onSetImportance={updateSkillImportance} onRefineGloss={refineSenseGloss} onRemoveSense={removeSense} savingType={savingSkillType} highlightType={highlightSkillType} levelChange={levelChange} />
               ) : axes ? (
                 <ParadigmSkillGrid axes={axes} skillRows={detail.skill ?? []} onSetLevel={updateSkillLevel} onSetImportance={updateSkillImportance} savingType={savingSkillType} highlightType={highlightSkillType} levelChange={levelChange} />
               ) : (
@@ -1243,15 +1314,23 @@ export function CardDetailPanel({ card, activeProject, onClose, onDeleted, onRen
             <div>
               <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wide mb-2">Suggested vocabulary</p>
               <div className="flex flex-wrap gap-1">
-                {seedInfo.offered.map(name => {
-                  const used = seedInfo.used.includes(name)
-                  return (
-                    <span
-                      key={name}
-                      className={`text-[10px] rounded px-1.5 py-0.5 ${used ? 'bg-blue-100 text-blue-700 font-medium' : 'bg-gray-100 text-gray-400'}`}
-                      title={used ? 'Used in this item' : 'Offered, not used'}
+                {seedInfo.offered.map(seed => {
+                  const used = seedInfo.used.includes(seed.name)
+                  const className = `text-[10px] rounded px-1.5 py-0.5 ${used ? 'bg-blue-100 text-blue-700 font-medium' : 'bg-gray-100 text-gray-400'}${onSelectCard ? ' hover:underline cursor-pointer' : ''}`
+                  const title = used ? 'Used in this item' : 'Offered, not used'
+                  return onSelectCard ? (
+                    <button
+                      key={seed.id}
+                      type="button"
+                      onClick={() => onSelectCard({ id: seed.id, name: seed.name, kind: 'vocabulary' })}
+                      className={className}
+                      title={title}
                     >
-                      {name}
+                      {seed.name}
+                    </button>
+                  ) : (
+                    <span key={seed.id} className={className} title={title}>
+                      {seed.name}
                     </span>
                   )
                 })}

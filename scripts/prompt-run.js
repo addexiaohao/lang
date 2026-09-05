@@ -27,7 +27,7 @@ import { createClient } from '@supabase/supabase-js'
 import Anthropic from '@anthropic-ai/sdk'
 
 import { generatePracticeItem, generatePracticeBatch, composePracticePrompt, PracticeGenerationFailedError, DEFAULT_PRACTICE_MODEL } from '../lib/practiceGenerate.js'
-import { getPracticeRule, resolvePracticeRule } from '../lib/practiceRules.js'
+import { resolveLanguagePack } from '../lib/resolveLanguagePack.js'
 import { promptKeyFor, ensurePromptFiles, readLivePrompt, resolveVersionSpec, livePromptPath, relativeToRepo } from '../lib/prompts/promptFiles.js'
 import { resolveSkillType } from '../lib/skillTypes.js'
 
@@ -111,10 +111,13 @@ async function resolveSkillById(skillId) {
     .single()
   if (error || !data) throw new Error(`Skill ${skillId} not found`)
   const card = data.knowledge_cards
-  const { data: project } = await supabase.from('projects').select('tts_locale').eq('id', card.project_id).single()
+  const [{ data: project }, pack] = await Promise.all([
+    supabase.from('projects').select('tts_locale').eq('id', card.project_id).single(),
+    resolveLanguagePack(card.project_id, { client: supabase }),
+  ])
   // A sense skill's DB type is always literally 'meaning' — resolveSkillType() gives back its real
   // identity (the sense key), same as every other read path (see lib/skillTypes.js).
-  return { skillType: resolveSkillType(data), level: data.level ?? 1, card, ttsLocale: project?.tts_locale }
+  return { skillType: resolveSkillType(data), level: data.level ?? 1, card, ttsLocale: project?.tts_locale, pack }
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -129,9 +132,12 @@ async function resolveCardSkills(nameOrId) {
     card = data?.[0]
   }
   if (!card) throw new Error(`Card "${nameOrId}" not found`)
-  const { data: project } = await supabase.from('projects').select('tts_locale').eq('id', card.project_id).single()
-  const { data: skills } = await supabase.from('skill').select('id, type, sense_type, level').eq('card_id', card.id)
-  return { card, ttsLocale: project?.tts_locale, skills: (skills ?? []).map(s => ({ ...s, type: resolveSkillType(s) })) }
+  const [{ data: project }, { data: skills }, pack] = await Promise.all([
+    supabase.from('projects').select('tts_locale').eq('id', card.project_id).single(),
+    supabase.from('skill').select('id, type, sense_type, level').eq('card_id', card.id),
+    resolveLanguagePack(card.project_id, { client: supabase }),
+  ])
+  return { card, ttsLocale: project?.tts_locale, pack, skills: (skills ?? []).map(s => ({ ...s, type: resolveSkillType(s) })) }
 }
 
 // Resolves { problemType, questionType, extraPrompt, promptKey } for one skill, honoring --prompt
@@ -139,15 +145,15 @@ async function resolveCardSkills(nameOrId) {
 // then applies the on-disk override from prompts/<promptKey>/prompt.md if present (see
 // lib/prompts/promptFiles.js) — seeding that file from the current hardcoded extraPrompt on first
 // use so there's always a live copy to edit.
-function resolveRule({ skillType, level, cardName, cardTags, promptOverride }) {
+function resolveRule({ pack, card, skillType, level, promptOverride }) {
   let rule
   if (promptOverride) {
     const parts = promptOverride.split('.')
     const problemType = parts.length >= 3 ? parts[1] : promptOverride
-    rule = resolvePracticeRule(skillType, problemType, { cardName, cardTags })
+    rule = pack.resolveDrillRule(card, skillType, problemType)
     if (!rule) throw new Error(`No problem type "${problemType}" configured for skill type "${skillType}"`)
   } else {
-    rule = getPracticeRule(skillType, level, { cardName, cardTags })
+    rule = pack.drillRuleFor(card, skillType, level)
     if (!rule) throw new Error(`No practiceable problem type configured for skill type "${skillType}" at level ${level}`)
   }
   const promptKey = promptKeyFor(skillType, rule.problemType)
@@ -290,10 +296,10 @@ async function runOnce(ctx) {
 }
 
 async function buildSkillContext(args, resolved) {
-  const { skillType, level, card, ttsLocale } = resolved
-  const rule = resolveRule({ skillType, level, cardName: card.name, cardTags: card.tags, promptOverride: args.prompt })
+  const { skillType, level, card, ttsLocale, pack } = resolved
+  const rule = resolveRule({ pack, card, skillType, level, promptOverride: args.prompt })
   // seedCardNames is filled in per-conversation by runOnce, not here — see its comment.
-  const promptContext = { ttsLocale, card, skillType, problemType: rule.problemType, extraPrompt: rule.extraPrompt, seedCardNames: [] }
+  const promptContext = { ttsLocale, card, skillType, problemType: rule.problemType, extraPrompt: rule.extraPrompt, requireFrame: rule.requireFrame, vocabularyPolicy: pack.vocabularyPolicyText(), seedCardNames: [] }
   return {
     mode: rule.questionType, promptContext, n: args.n, terse: args.terse,
     promptKey: rule.promptKey, cardName: card.name, skillType, level,
@@ -302,9 +308,9 @@ async function buildSkillContext(args, resolved) {
 }
 
 async function runCardMode(args) {
-  const { card, ttsLocale, skills } = await resolveCardSkills(args.card)
+  const { card, ttsLocale, skills, pack } = await resolveCardSkills(args.card)
   const practiceable = skills
-    .map(s => ({ ...s, rule: getPracticeRule(s.type, s.level ?? 1, { cardName: card.name, cardTags: card.tags }) }))
+    .map(s => ({ ...s, rule: pack.drillRuleFor(card, s.type, s.level ?? 1) }))
     .filter(s => s.rule)
   if (practiceable.length === 0) throw new Error(`Card "${card.name}" has no skills with a configured problem type`)
 
@@ -320,7 +326,7 @@ async function runCardMode(args) {
     const { seeded, promptPath } = ensurePromptFiles(promptKey, s.rule.extraPrompt)
     if (seeded) console.error(`(seeded ${relativeToRepo(promptPath)} from the current prompt)`)
     const extraPrompt = readLivePrompt(promptKey) ?? s.rule.extraPrompt
-    const promptContext = { ttsLocale, card, skillType: s.type, problemType: s.rule.problemType, extraPrompt, seedCardNames: [] }
+    const promptContext = { ttsLocale, card, skillType: s.type, problemType: s.rule.problemType, extraPrompt, requireFrame: s.rule.requireFrame, vocabularyPolicy: pack.vocabularyPolicyText(), seedCardNames: [] }
     await runOnce({
       mode: s.rule.questionType, promptContext, n: count, terse: args.terse,
       promptKey, cardName: card.name, skillType: s.type, level: s.level ?? 1, batchSize: args.batch,
@@ -332,10 +338,10 @@ async function runCardMode(args) {
 // Deliberately never prints the composed prompt (unlike runOnce) — doing so before the A/B reveal
 // would let the user recognize their own draft's wording and unblind the comparison.
 async function runCompare(args, resolved) {
-  const { skillType, level, card, ttsLocale } = resolved
+  const { skillType, level, card, ttsLocale, pack } = resolved
   const rule = args.prompt
-    ? resolvePracticeRule(skillType, args.prompt.split('.')[1] ?? args.prompt, { cardName: card.name, cardTags: card.tags })
-    : getPracticeRule(skillType, level, { cardName: card.name, cardTags: card.tags })
+    ? pack.resolveDrillRule(card, skillType, args.prompt.split('.')[1] ?? args.prompt)
+    : pack.drillRuleFor(card, skillType, level)
   if (!rule) throw new Error(`No practiceable problem type configured for skill type "${skillType}"`)
   const promptKey = promptKeyFor(skillType, rule.problemType)
   ensurePromptFiles(promptKey, rule.extraPrompt)
@@ -356,7 +362,7 @@ async function runCompare(args, resolved) {
 
   const start = Date.now()
   const pairs = await Promise.all(seeds.map(seedCardNames => Promise.all(['A', 'B'].map(async label => {
-    const promptContext = { ttsLocale, card, skillType, problemType: rule.problemType, extraPrompt: labeled[label].text, seedCardNames }
+    const promptContext = { ttsLocale, card, skillType, problemType: rule.problemType, extraPrompt: labeled[label].text, requireFrame: rule.requireFrame, vocabularyPolicy: pack.vocabularyPolicyText(), seedCardNames }
     const result = await generateOne({ mode: rule.questionType, promptContext })
     return { label, result }
   }))))

@@ -1,4 +1,5 @@
-import { SKILL_TYPES, deriveFlatSkillTypes, hasSenseAxis, senseValues, axisValueKey, axisValueGloss } from '../../lib/skillTypes.js'
+import { hasSenseAxis, senseValues, axisValueKey, axisValueGloss } from '../../lib/skillTypes.js'
+import { useLanguagePack } from '../LanguagePackContext.jsx'
 import { levelToColor } from '../levelColor.js'
 
 // Level 1-10 -> bar height in px, linear.
@@ -34,6 +35,7 @@ function Bars({ entries, label }) {
 // order; any OTHER paradigm card (a declension grid etc.) still renders nothing — a multi-axis grid
 // has no single meaningful bar order the way a one-dimensional sense axis does.
 export function SkillBadge({ card, skills }) {
+  const pack = useLanguagePack()
   const levelByType = new Map((skills ?? []).map(s => [s.type, s.level]))
 
   if (hasSenseAxis(card)) {
@@ -50,9 +52,8 @@ export function SkillBadge({ card, skills }) {
 
   if (card.details?.axes) return null
 
-  const order = SKILL_TYPES[card.kind] ?? []
-  const applicable = new Set(deriveFlatSkillTypes(card))
-  const types = order.filter(t => applicable.has(t))
+  // Applicable flat skill types for this card, already in the pack's display order.
+  const types = pack ? pack.skillTypesForCard(card) : []
   if (types.length === 0) return null
 
   const entries = types.map(type => {

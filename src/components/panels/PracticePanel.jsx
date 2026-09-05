@@ -17,7 +17,7 @@ import { ChatPanel } from './ChatPanel.jsx'
 // skill.
 // Nothing here persists — reload or close and the session is gone, by design (see CLAUDE.md /
 // practice-prototype-plan.md hard constraints).
-export function PracticePanel({ activeProject, practiceSession, onDragStart, onClose, onSidePanelCountChange, onStartPractice, generatedContext, tagCatalog, onNewTags }) {
+export function PracticePanel({ activeProject, practiceSession, onDragStart, onClose, onSidePanelCountChange, onStartPractice, generatedContext, tagCatalog, onNewTags, onSelectCard }) {
   const { skills, capNotice } = practiceSession
   // End-of-session "More practice" button state (see handleRestart below) — separate from
   // `loading`, which is about generating the current item, not fetching a new selection.
@@ -197,8 +197,9 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     // that as `skill` on the item so result recording / Explain / the card panel act on the real
     // thing, not on targetSkill.
     // seed: { offered, used } — the "other vocabulary already known" pool offered to the model
-    // (body.seed_card_names) vs. what it reports actually using (item.used_seed_words) — shown in
-    // the auto-opened card panel alongside the skill tested.
+    // (body.seed_cards, each { id, name }) vs. what it reports actually using (item.used_seed_words,
+    // names only) — shown in the auto-opened card panel alongside the skill tested, offered names
+    // rendered as links via their id.
     // rawItem/problemType are kept alongside the displayable item so handleEasierSentence can
     // extend itemHistory and pin the chain's problemType on the next continuation request.
     return {
@@ -209,7 +210,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
       request: body.request ?? null,
       model: body.request?.model ?? null,
       skill: { card: body.card ?? targetSkill.card, type: body.skill_type ?? targetSkill.type },
-      seed: { offered: body.seed_card_names ?? [], used: body.item?.used_seed_words ?? [] },
+      seed: { offered: body.seed_cards ?? [], used: body.item?.used_seed_words ?? [] },
     }
   }, [activeProject?.id])
 
@@ -559,6 +560,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
             seedInfo={current?.seed ?? null}
             tagCatalog={tagCatalog}
             onNewTags={onNewTags}
+            onSelectCard={onSelectCard}
           />
         </div>
       )}

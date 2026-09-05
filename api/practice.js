@@ -2,7 +2,8 @@ import Anthropic from '@anthropic-ai/sdk'
 import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
 import { generatePracticeItem, PracticeGenerationFailedError, DEFAULT_PRACTICE_MODEL, toRawToolInput } from '../lib/practiceGenerate.js'
-import { getPracticeRule, resolvePracticeRule, practiceableSkillTypes, buildDiscriminationRule, MAX_EASIER_SENTENCE_ATTEMPTS } from '../lib/practiceRules.js'
+import { buildDiscriminationRule, MAX_EASIER_SENTENCE_ATTEMPTS } from '../lib/practiceRules.js'
+import { resolveLanguagePack } from '../lib/resolveLanguagePack.js'
 import { EXCLUDE_RECENT_DAYS, RETIRED_LEVEL } from '../lib/practiceSelection.js'
 import { hasSenseAxis, senseValues, axisValueKey, axisValueGloss, skillDbColumns, resolveSkillType } from '../lib/skillTypes.js'
 import { DEFAULT_CHECK_MODEL } from '../lib/mcClozeCheck.js'
@@ -34,8 +35,8 @@ function shuffle(arr) {
 // (lib/practiceRules.js's SKILL_PROBLEM_TYPES) — used when the originally requested skill_type has
 // none. Keeps a practice session from hard-erroring on an unconfigured skill type; the caller
 // substitutes this skill in and generates for it instead, silently.
-async function pickSubstituteSkill(projectId) {
-  const types = practiceableSkillTypes()
+async function pickSubstituteSkill(projectId, pack) {
+  const types = pack.practiceableSkillTypes()
   if (types.length === 0) return null
   // Retired (level = 10, plan.md §5) and recently-correct skills are never auto-selected,
   // substitution included — same rule lib/practiceSelection.js's quick-start weighted sample
@@ -123,9 +124,10 @@ export default async function handler(req, res) {
     throw e
   }
 
-  const [{ data: project }, { data: card, error: cardError }] = await Promise.all([
+  const [{ data: project }, { data: card, error: cardError }, pack] = await Promise.all([
     supabase.from('projects').select('tts_locale').eq('id', project_id).single(),
     supabase.from('knowledge_cards').select('id, name, kind, tags, details').eq('project_id', project_id).eq('id', card_id).single(),
+    resolveLanguagePack(project_id),
   ])
   if (cardError || !card) return res.status(404).json({ error: 'Card not found' })
 
@@ -146,12 +148,12 @@ export default async function handler(req, res) {
   let effectiveLevel = skillRow?.level ?? 1
   let effectiveSkillId = skillRow?.id ?? null
 
-  // A sense skill's type (e.g. "financial") isn't a literal key in lib/practiceRules.js's
-  // SKILL_PROBLEM_TYPES — it's drilled exactly like an ordinary vocabulary `meaning` skill, just
-  // with its own gloss threaded into extraPrompt below so generation targets the right sense, not
-  // just any sense (plan.md — "Word Senses" §4 calls this "the single most likely thing to be
-  // missed"). ruleLookupType is only used to pick/resolve the problem type; effectiveSkillType stays
-  // the real dotted-path type everywhere else (DB writes, the response, Explain, etc).
+  // A sense skill's type (e.g. "financial") isn't a literal skill_type_def key — it's drilled
+  // exactly like an ordinary vocabulary `meaning` skill, just with its own gloss threaded into
+  // extraPrompt below so generation targets the right sense, not just any sense (plan.md — "Word
+  // Senses" §4 calls this "the single most likely thing to be missed"). ruleLookupType is only used
+  // to pick/resolve the drill rule; effectiveSkillType stays the real dotted-path type everywhere
+  // else (DB writes, the response, Explain, etc).
   const senseGloss = senseGlossFor(effectiveCard, effectiveSkillType)
   const ruleLookupType = senseGloss != null ? 'meaning' : effectiveSkillType
 
@@ -163,11 +165,11 @@ export default async function handler(req, res) {
   // turns for. Only trusted when it resolves; otherwise falls through to a fresh pick below and
   // the stale history is discarded (see effectiveHistory).
   //
-  // discrimination_cloze (Card Groups, plan.md) is a special case: it has no static row in
-  // SKILL_PROBLEM_TYPES for resolvePracticeRule to find (its extraPrompt is built from the card's
-  // live group membership, not fixed prompt text), so continuing one means re-fetching that
-  // membership and rebuilding the rule rather than a table lookup. Falls through to a fresh pick
-  // (like any other unresolvable problem_type) if the card is no longer grouped.
+  // discrimination_cloze (Card Groups, plan.md) is a special case: it has no drill_rule row for
+  // resolveDrillRule to find (its extraPrompt is built from the card's live group membership, not
+  // fixed prompt text), so continuing one means re-fetching that membership and rebuilding the rule
+  // rather than a table lookup. Falls through to a fresh pick (like any other unresolvable
+  // problem_type) if the card is no longer grouped.
   let rule = null
   if (rawHistory.length > 0 && problem_type === 'discrimination_cloze') {
     const discriminationGroup = await pickDiscriminationGroup(effectiveCard.id)
@@ -175,26 +177,26 @@ export default async function handler(req, res) {
       rule = buildDiscriminationRule({ cardName: effectiveCard.name, groupNote: discriminationGroup.groupNote, otherMembers: discriminationGroup.others })
     }
   } else if (rawHistory.length > 0 && typeof problem_type === 'string') {
-    rule = resolvePracticeRule(ruleLookupType, problem_type, { cardName: effectiveCard.name, cardTags: effectiveCard.tags })
+    rule = pack.resolveDrillRule(effectiveCard, ruleLookupType, problem_type)
   }
   const continuingHistory = rule != null
 
   if (!rule) {
-    rule = getPracticeRule(ruleLookupType, effectiveLevel, { cardName: effectiveCard.name, cardTags: effectiveCard.tags })
+    rule = pack.drillRuleFor(effectiveCard, ruleLookupType, effectiveLevel)
   }
   let substituted = false
   if (!rule) {
-    // The requested skill_type has no problem type configured for its current level
-    // (lib/practiceRules.js) — silently swap in a different, practiceable skill rather than
-    // erroring the session out.
-    const substitute = await pickSubstituteSkill(project_id)
+    // The requested skill_type has no enabled drill rule for its current level (the project's
+    // language pack) — silently swap in a different, practiceable skill rather than erroring the
+    // session out.
+    const substitute = await pickSubstituteSkill(project_id, pack)
     if (!substitute) return res.status(422).json({ error: 'No practiceable skill types configured for this project' })
     effectiveCard = substitute.card
     effectiveSkillType = substitute.skillType
     effectiveLevel = substitute.level
     effectiveSkillId = substitute.skillId
     substituted = true
-    rule = getPracticeRule(effectiveSkillType, effectiveLevel, { cardName: effectiveCard.name, cardTags: effectiveCard.tags })
+    rule = pack.drillRuleFor(effectiveCard, effectiveSkillType, effectiveLevel)
     if (!rule) return res.status(422).json({ error: 'No practiceable skill types configured for this project' })
   }
 
@@ -225,7 +227,7 @@ export default async function handler(req, res) {
     }
   }
 
-  const { questionType: mode, problemType, extraPrompt } = rule
+  const { questionType: mode, problemType, extraPrompt, requireFrame } = rule
   // Only replay history when we're actually continuing the same (skillType, problemType) it was
   // generated under — a substitution or a fresh random pick above means this is a different
   // conversation and the old turns don't belong in it.
@@ -239,12 +241,13 @@ export default async function handler(req, res) {
   // financial sense readable) — ordinary (non-sense) cards keep the prior unrestricted behavior.
   const { data: seedPool } = await supabase
     .from('knowledge_cards')
-    .select('name, details, skill(type, level)')
+    .select('id, name, details, skill(type, level)')
     .eq('project_id', project_id).eq('kind', 'vocabulary').neq('id', effectiveCard.id).limit(300)
   const eligibleSeeds = (seedPool ?? []).filter(c => !hasSenseAxis(c) || (c.skill ?? []).some(s => (s.level ?? 0) >= 5))
-  const seedCardNames = shuffle(eligibleSeeds).slice(0, 15).map(c => c.name)
+  const seedCards = shuffle(eligibleSeeds).slice(0, 15).map(c => ({ id: c.id, name: c.name }))
+  const seedCardNames = seedCards.map(c => c.name)
 
-  const promptContext = { ttsLocale: project?.tts_locale, card: effectiveCard, skillType: effectiveSkillType, problemType, extraPrompt, seedCardNames }
+  const promptContext = { ttsLocale: project?.tts_locale, card: effectiveCard, skillType: effectiveSkillType, problemType, extraPrompt, requireFrame, seedCardNames, vocabularyPolicy: pack.vocabularyPolicyText() }
 
   let request = null
   // Every mc_cloze answer-uniqueness check (lib/mcClozeCheck.js) generatePracticeItem runs — the
@@ -264,6 +267,9 @@ export default async function handler(req, res) {
         checkLogs.push(logMcClozeCheck({
           skillId: effectiveSkillId, cardId: effectiveCard.id, skillType: effectiveSkillType,
           model: CHECK_MODEL, item: checkedItem, verification,
+          // `request` is set by onRequest right before each generation call (and again before a
+          // retry), so it holds the exact { model, system, messages } that produced `checkedItem`.
+          conversation: request,
         }))
       },
       onUsage: ({ model: usedModel, usage, stopReason, latencyMs, isRetry }) => {
@@ -291,9 +297,11 @@ export default async function handler(req, res) {
     // View card) — see PracticePanel.jsx's requestItem(). seed_card_names is the pool offered to
     // the model as "other vocabulary already known" (lib/prompts/registry.js's seedSection) — the
     // client pairs it with item.used_seed_words to show what was offered vs. what was actually used.
+    // seed_cards carries each offered word's card id (name-only seed_card_names above is what the
+    // prompt itself sees) so the client can render "Suggested vocabulary" as links to those cards.
     // problem_type is round-tripped back so a subsequent "Easier sentence" click can pin the same
     // problemType via resolvePracticeRule above, instead of re-rolling it.
-    return res.status(200).json({ item, mode, request, card: effectiveCard, skill_type: effectiveSkillType, seed_card_names: seedCardNames, problem_type: problemType })
+    return res.status(200).json({ item, mode, request, card: effectiveCard, skill_type: effectiveSkillType, seed_card_names: seedCardNames, seed_cards: seedCards, problem_type: problemType })
   } catch (e) {
     await Promise.all([...checkLogs, ...usageLogs])
     if (e instanceof PracticeGenerationFailedError) {

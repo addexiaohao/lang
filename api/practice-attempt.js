@@ -1,6 +1,7 @@
 import { requireUser, requireProjectAccess, AuthError } from '../lib/auth.js'
 import { supabase } from '../lib/supabaseAdmin.js'
-import { validateSkillType, skillDbColumns } from '../lib/skillTypes.js'
+import { skillDbColumns } from '../lib/skillTypes.js'
+import { resolveLanguagePack } from '../lib/resolveLanguagePack.js'
 import { logPracticeAttempt } from '../lib/practiceAttempts.js'
 
 // Logs a practice_attempt row that does NOT touch skill.level/last_correct — currently only the
@@ -39,7 +40,8 @@ export default async function handler(req, res) {
     .eq('id', card_id)
     .single()
   if (cardErr || !card) return res.status(404).json({ error: 'Card not found' })
-  if (!validateSkillType(card, skill_type)) {
+  const pack = await resolveLanguagePack(project_id)
+  if (!pack.validateSkillType(card, skill_type)) {
     return res.status(400).json({ error: `"${skill_type}" is not a valid skill type for this card` })
   }
 

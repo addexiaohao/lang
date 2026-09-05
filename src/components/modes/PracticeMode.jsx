@@ -40,6 +40,7 @@ export function PracticeMode({
               generatedContext={generatedContext}
               tagCatalog={tagCatalog}
               onNewTags={onNewTags}
+              onSelectCard={onSelectCard}
             />
           ) : browsing ? (
             <CardsPanel

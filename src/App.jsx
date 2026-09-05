@@ -6,6 +6,7 @@ import { supabase } from './supabaseClient.js'
 import { Sidebar } from './components/Sidebar.jsx'
 import { ProjectSwitcher } from './components/ProjectSwitcher.jsx'
 import { SettingsModal } from './components/SettingsModal.jsx'
+import { LanguagePackProvider } from './LanguagePackContext.jsx'
 import { ChatDock } from './components/ChatDock.jsx'
 import { Overlay } from './components/Overlay.jsx'
 import { ChatPanel } from './components/panels/ChatPanel.jsx'
@@ -13,6 +14,7 @@ import { CardDetailPanel } from './components/panels/CardDetailPanel.jsx'
 import { TagsPanel } from './components/panels/TagsPanel.jsx'
 import { LibraryMode, LIBRARY_DEFAULT_WIDTHS } from './components/modes/LibraryMode.jsx'
 import { PracticeMode } from './components/modes/PracticeMode.jsx'
+import { DebugMode } from './components/modes/DebugMode.jsx'
 
 // Three activity modes replace the old entity-based sidebar (plan.md Part B). Library/Learn/
 // Practice are all mounted here unconditionally and only *hidden* via CSS `display` depending on
@@ -198,6 +200,7 @@ export default function App() {
   if (projectsLoading) return null
 
   return (
+    <LanguagePackProvider projectId={activeProject?.id}>
     <div className="flex h-screen overflow-hidden">
       <Sidebar
         mode={mode}
@@ -237,6 +240,10 @@ export default function App() {
             tagCatalog={tagCatalog}
             onNewTags={refreshTagCatalog}
           />
+        </div>
+
+        <div style={{ display: mode === 'debug' ? 'flex' : 'none' }} className="flex-1 h-full overflow-hidden">
+          <DebugMode activeProject={activeProject} />
         </div>
 
         <ChatDock
@@ -314,9 +321,10 @@ export default function App() {
         </Overlay>
 
         {showSettings && activeProject && (
-          <SettingsModal project={activeProject} onClose={() => setShowSettings(false)} />
+          <SettingsModal project={activeProject} tagCatalog={tagCatalog} onClose={() => setShowSettings(false)} />
         )}
       </div>
     </div>
+    </LanguagePackProvider>
   )
 }

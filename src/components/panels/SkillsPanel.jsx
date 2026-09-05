@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { apiFetch } from '../../apiFetch.js'
-import { SKILL_TYPES } from '../../../lib/skillTypes.js'
+import { useLanguagePack } from '../../LanguagePackContext.jsx'
 import { PRACTICE_STATES, PRACTICE_STATE_LABELS } from '../../../lib/practiceStates.js'
 import { levelToColor, importanceToColor } from '../../levelColor.js'
 import { MultiSelectPopover } from '../MultiSelectPopover.jsx'
@@ -17,8 +17,6 @@ const KIND_COLORS = {
   grammar: 'bg-purple-100 text-purple-700',
   expression: 'bg-orange-100 text-orange-700',
 }
-const ALL_SKILL_TYPES = [...new Set(Object.values(SKILL_TYPES).flat())].sort()
-
 const SORT_OPTIONS = [
   { value: 'level', label: 'Level' },
   { value: 'last_practiced', label: 'Last practiced' },
@@ -366,6 +364,8 @@ function ExpandedRow({ attempts }) {
 }
 
 export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragStart, onClose }) {
+  const pack = useLanguagePack()
+  const allSkillTypes = pack ? [...new Set(pack.skillTypes.map(s => s.key))].sort() : []
   const [items, setItems] = useState([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(false)
@@ -646,7 +646,7 @@ export function SkillsPanel({ activeProject, tagCatalog, onSelectCard, onDragSta
             className="text-[10px] bg-gray-100 text-gray-600 rounded px-1 py-0.5 border-none focus:outline-none focus:ring-1 focus:ring-blue-400"
           >
             <option value="">Any skill</option>
-            {ALL_SKILL_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+            {allSkillTypes.map(t => <option key={t} value={t}>{t}</option>)}
           </select>
           <MultiSelectPopover label="State" options={stateOptions} selected={states} onToggle={toggleState} />
           <MultiSelectPopover label="Tags" options={tagOptions} selected={tagsSelected} onToggle={toggleTag} />

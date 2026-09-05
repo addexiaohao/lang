@@ -4,6 +4,7 @@ import { selectScheduledPracticeSkills, RETIRED_LEVEL } from '../lib/practiceSel
 import { FAILURE_CAP } from '../lib/practiceScheduling.js'
 import { PRACTICE_STATES } from '../lib/practiceStates.js'
 import { resolveSkillType } from '../lib/skillTypes.js'
+import { resolveLanguagePack } from '../lib/resolveLanguagePack.js'
 
 // A sense skill's DB `type` is always literally 'meaning' (see lib/skillTypes.js's sense_type
 // column comment) — every raw `skill` row read below resolves it to the ONE external skill_type
@@ -169,12 +170,13 @@ export default async function handler(req, res) {
     // plus each skill's most recent practice_attempt timestamp (for the cooldown check) — so
     // lib/practiceSelection.js can re-select as many times as it needs (a card with nothing
     // practiceable right now just gets dropped in memory) without going back to the DB.
-    const [{ data, error, count }, { data: lastAttempts, error: lastAttemptsErr }] = await Promise.all([
+    const [{ data, error, count }, { data: lastAttempts, error: lastAttemptsErr }, pack] = await Promise.all([
       supabase
         .from('knowledge_cards')
         .select('id, name, kind, tags, details, importance, skill(id, type, sense_type, level, importance, last_correct, state, interval_days, due_at)', { count: 'exact' })
         .eq('project_id', project_id),
       supabase.rpc('skill_last_attempt', { p_project_id: project_id }),
+      resolveLanguagePack(project_id),
     ])
     if (error) return res.status(500).json({ error: error.message })
     if (lastAttemptsErr) return res.status(500).json({ error: lastAttemptsErr.message })
@@ -184,7 +186,9 @@ export default async function handler(req, res) {
       ...card,
       skills: skill.map((row) => ({ ...resolveRow(row), last_attempt_at: lastAttemptById.get(row.id) ?? null })),
     }))
-    const { picks, relearningCount, capHit } = selectScheduledPracticeSkills(cards, Number(limit))
+    const { picks, relearningCount, capHit } = selectScheduledPracticeSkills(cards, Number(limit), {
+      isGateSatisfied: (card, type, rows) => pack.isGateSatisfied(card, type, rows),
+    })
     const skills = picks.map(({ card: { skills: _skills, ...card }, skill }) => ({ ...skill, card }))
     return res.status(200).json({
       skills,
