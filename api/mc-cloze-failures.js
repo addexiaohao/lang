@@ -3,8 +3,9 @@ import { supabase } from '../lib/supabaseAdmin.js'
 
 // GET ?project_id=&limit=&offset= -> mc_cloze_check_failure rows (see lib/mcClozeCheckLog.js) with
 // the card name/kind attached, newest first. Backs the Debug mode's "MC-cloze failures" panel —
-// each row is a generated item whose answer-uniqueness check failed, including the full generation
-// `conversation` so a failure can be traced back to the exact prompt that produced it.
+// each row is a generated item whose answer-uniqueness check failed, including the full
+// `conversation` history ({ generation: { request, response }, checks: [...] } — see
+// lib/mcClozeCheckLog.js) so a failure can be replayed end to end.
 export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
 

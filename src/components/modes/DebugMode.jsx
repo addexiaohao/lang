@@ -1,16 +1,19 @@
 import { useState } from 'react'
 import { DebugNotesPanel } from '../panels/DebugNotesPanel.jsx'
 import { McClozeFailuresPanel } from '../panels/McClozeFailuresPanel.jsx'
+import { McClozeStatsPanel } from '../panels/McClozeStatsPanel.jsx'
 
-// Debug mode: a dev/self-use audit view, not an entity to browse. Two sub-parts, switched by a
+// Debug mode: a dev/self-use audit view, not an entity to browse. Three sub-parts, switched by a
 // plain tab strip (not Library's resizable multi-panel layout — there's nothing here that makes
 // sense to view side by side): every practice_note (CLAUDE.md "user debug notes" via
-// api/practice-note.js) with the question it was taken against, and every mc_cloze_check_failure
-// with its full generation context. Mounted always (App.jsx's mode convention) with both
-// sub-panels also always-mounted underneath, so switching tabs never loses scroll/pagination state.
+// api/practice-note.js) with the question it was taken against, every mc_cloze_check_failure
+// with its full generation context, and a rough pass-rate summary over recent mc_cloze attempts.
+// Mounted always (App.jsx's mode convention) with all sub-panels also always-mounted underneath,
+// so switching tabs never loses scroll/pagination state.
 const DEBUG_TABS = [
   { id: 'notes', label: 'Notes' },
   { id: 'mcloze', label: 'MC-cloze failures' },
+  { id: 'mcloze-stats', label: 'MC-cloze stats' },
 ]
 
 export function DebugMode({ activeProject }) {
@@ -37,6 +40,9 @@ export function DebugMode({ activeProject }) {
         </div>
         <div style={{ display: tab === 'mcloze' ? 'block' : 'none' }} className="absolute inset-0">
           <McClozeFailuresPanel activeProject={activeProject} />
+        </div>
+        <div style={{ display: tab === 'mcloze-stats' ? 'block' : 'none' }} className="absolute inset-0">
+          <McClozeStatsPanel activeProject={activeProject} />
         </div>
       </div>
     </div>

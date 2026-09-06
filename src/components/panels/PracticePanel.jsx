@@ -124,7 +124,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
   // fresh card-detail fetch so the auto-shown panel picks up the new level instead of the
   // pre-answer one it was prefetched with, and diff against `beforeLevel` (the level as of the
   // moment the answer was given — see handleAnswered) to drive the +N/-N badge.
-  const recordPracticeResult = useCallback((targetSkill, correct, beforeLevel, encounterId, model, requestSnapshot, rawItem) => {
+  const recordPracticeResult = useCallback((targetSkill, correct, beforeLevel, encounterId, model, requestSnapshot, rawResponse) => {
     apiFetch(`/api/knowledge-cards?${new URLSearchParams({ project_id: activeProject.id, id: targetSkill.card.id })}`, {
       method: 'PATCH',
       body: JSON.stringify({
@@ -132,7 +132,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
         practice_result: correct ? 'correct' : 'incorrect',
         encounter_id: encounterId,
         model,
-        conversation: { request: requestSnapshot, response: rawItem },
+        conversation: { request: requestSnapshot, response: rawResponse },
       }),
     })
       .then(() => fetchCardDetail(targetSkill.card, { force: true }))
@@ -150,7 +150,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
   // api/practice-attempt.js endpoint. Shares the same encounterId as whatever round comes next in
   // this chain (handleEasierSentence doesn't touch encounterIdRef), so all rounds of one "Easier
   // sentence" chain land under one encounter_id. Fire-and-forget, same as recordPracticeResult.
-  const logTooHard = useCallback((targetSkill, encounterId, model, requestSnapshot, rawItem) => {
+  const logTooHard = useCallback((targetSkill, encounterId, model, requestSnapshot, rawResponse) => {
     if (!encounterId) return
     apiFetch('/api/practice-attempt', {
       method: 'POST',
@@ -161,7 +161,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
         encounter_id: encounterId,
         outcome: 'too_hard',
         model,
-        conversation: { request: requestSnapshot, response: rawItem },
+        conversation: { request: requestSnapshot, response: rawResponse },
       }),
     }).catch(e => console.error('[practice] failed to log too_hard attempt', e))
   }, [activeProject?.id])
@@ -202,11 +202,19 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     // rendered as links via their id.
     // rawItem/problemType are kept alongside the displayable item so handleEasierSentence can
     // extend itemHistory and pin the chain's problemType on the next continuation request.
+    // rawResponse is the full raw model response (for mc_cloze, the Step 1 sentence-drafting text
+    // ahead of the tool call too, see lib/practiceRules.js) — kept only for conversation-history
+    // logging (recordPracticeResult/logTooHard below); never rendered.
     return {
       ...body.item,
       mode: body.mode,
       problemType: body.problem_type,
+      // Some drills (production-which-preposition/conjunction) test PRODUCING the right word for a
+      // stated meaning, not inferring meaning from context — see PracticeMcCloze.jsx, which shows
+      // `translation` before the learner answers instead of only after when this is set.
+      revealTranslation: !!body.reveal_translation,
       rawItem: body.item,
+      rawResponse: body.response ?? null,
       request: body.request ?? null,
       model: body.request?.model ?? null,
       skill: { card: body.card ?? targetSkill.card, type: body.skill_type ?? targetSkill.type },
@@ -286,7 +294,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
     setCardOpen(true)
     setLevelChange(null)
     const beforeLevel = cardDetails[effectiveSkill.card.id]?.skill?.find(s => s.type === effectiveSkill.type)?.level ?? null
-    recordPracticeResult(effectiveSkill, correct, beforeLevel, encounterIdRef.current, current?.model, current?.request, current?.rawItem)
+    recordPracticeResult(effectiveSkill, correct, beforeLevel, encounterIdRef.current, current?.model, current?.request, current?.rawResponse)
     setResults(prev => ({ ...prev, [index]: { skill: effectiveSkill, correct } }))
   }
 
@@ -370,7 +378,7 @@ export function PracticePanel({ activeProject, practiceSession, onDragStart, onC
   // `easierCount` reaches that cap (the server clamps `history` length too, independently).
   async function handleEasierSentence() {
     if (!current || easierCount >= MAX_EASIER_SENTENCE_ATTEMPTS) return
-    logTooHard(effectiveSkill, encounterIdRef.current, current.model, current.request, current.rawItem)
+    logTooHard(effectiveSkill, encounterIdRef.current, current.model, current.request, current.rawResponse)
     setExplain(null)
     setAddSource(null)
     setLoading(true)

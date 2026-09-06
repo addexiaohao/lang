@@ -588,11 +588,15 @@ alter table skill add column if not exists state text not null default 'never'
 alter table skill add column if not exists interval_days smallint;
 alter table skill add column if not exists due_at timestamptz;
 
--- The exact { model, system, messages } sent to Anthropic for the generation attempt that produced
--- the flagged item — the same shape api/practice.js round-trips back to the client as `request`.
--- Lets a failed answer-uniqueness check be traced back to the full prompt/conversation that made it,
--- not just the item's own sentence/options. Nullable: older rows predate this, and a check can in
--- principle fire before any onRequest (defensive).
+-- The ENTIRE conversation history behind the flagged item (lib/mcClozeCheckLog.js):
+--   { generation: { request, response }, checks: [ per-option checker conversation, ... ] }
+-- generation.request is the { model, system, messages } sent to the generation model (the shape
+-- api/practice.js also round-trips to the client as `request`); generation.response is that call's
+-- raw content array (thinking + Step 1 sentence draft + Step 2 tool call); checks[] is
+-- verifyMcClozeItem's per-option array, each entry its own { sentence, request, response,
+-- grammatical, sensible, reason }. Lets a failed answer-uniqueness check be replayed end to end, not
+-- just inspected via the item's own sentence/options. Nullable/partially-null: older rows predate
+-- this, and a check can in principle fire before onRequest/onResponse (defensive).
 alter table mc_cloze_check_failure add column if not exists conversation jsonb;
 
 -- consecutive_correct/stable_interval_days: dropped. The old model needed them to remember a

@@ -196,9 +196,6 @@ function renderItem(index, mode, result, terse) {
     if (!terse) {
       if (item.frame) lines.push(`    frame: ${item.frame}`)
       lines.push(`    ${item.options.join(' / ').padEnd(58)} → ${item.answer}`)
-      if (item.distractor_reasons?.length) {
-        for (const { option, reason } of item.distractor_reasons) lines.push(`    ✗ ${option}: ${reason}`)
-      }
       const seeds = seedLine(item)
       if (seeds) lines.push(seeds)
     }

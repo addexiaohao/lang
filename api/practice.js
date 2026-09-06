@@ -250,6 +250,12 @@ export default async function handler(req, res) {
   const promptContext = { ttsLocale: project?.tts_locale, card: effectiveCard, skillType: effectiveSkillType, problemType, extraPrompt, requireFrame, seedCardNames, vocabularyPolicy: pack.vocabularyPolicyText() }
 
   let request = null
+  // The full raw Anthropic response (all content blocks — for mc_cloze this includes the model's
+  // `thinking` block, its sentence-drafting reasoning ahead of the tool call, see
+  // lib/practiceRules.js) for whichever attempt's item was actually returned. Round-tripped back to
+  // the client purely for conversation-history logging (practice_attempt.conversation) — the UI
+  // itself only ever renders `item`, never this.
+  let response = null
   // Every mc_cloze answer-uniqueness check (lib/mcClozeCheck.js) generatePracticeItem runs — the
   // initial attempt and, if it failed, the retry — gets logged here, pass or fail, via
   // onCheck. Awaited alongside the outcome below so a failed generation still gets its check
@@ -263,13 +269,25 @@ export default async function handler(req, res) {
     const item = await generatePracticeItem({
       anthropic, model: MODEL, checkModel: CHECK_MODEL, mode, promptContext, history: effectiveHistory,
       onRequest: r => { request = r },
+      // Fires on every attempt, thinking blocks included — logged server-side (not sent to the
+      // browser, and never shown in the practice UI) purely so the model's reasoning for mc_cloze
+      // is actually visible somewhere during development, since it's otherwise only ever persisted
+      // inside practice_attempt.conversation once an item is answered.
+      onResponse: r => {
+        response = r
+        const thinkingBlock = r.find(b => b.type === 'thinking')
+        if (thinkingBlock?.thinking) console.log(`[practice] mc_cloze thinking (${effectiveCard.name}/${effectiveSkillType}):`, thinkingBlock.thinking)
+      },
       onCheck: ({ item: checkedItem, verification }) => {
         checkLogs.push(logMcClozeCheck({
           skillId: effectiveSkillId, cardId: effectiveCard.id, skillType: effectiveSkillType,
           model: CHECK_MODEL, item: checkedItem, verification,
-          // `request` is set by onRequest right before each generation call (and again before a
-          // retry), so it holds the exact { model, system, messages } that produced `checkedItem`.
-          conversation: request,
+          // `request`/`response` are set by onRequest/onResponse around each generation call (and
+          // again on a retry), so they hold the exact prompt + raw model output that produced
+          // `checkedItem`. verification.checks carries every per-option checker conversation — the
+          // whole trail behind this failure lands in the row's `conversation` jsonb.
+          generationRequest: request,
+          generationResponse: response,
         }))
       },
       onUsage: ({ model: usedModel, usage, stopReason, latencyMs, isRetry }) => {
@@ -300,8 +318,13 @@ export default async function handler(req, res) {
     // seed_cards carries each offered word's card id (name-only seed_card_names above is what the
     // prompt itself sees) so the client can render "Suggested vocabulary" as links to those cards.
     // problem_type is round-tripped back so a subsequent "Easier sentence" click can pin the same
-    // problemType via resolvePracticeRule above, instead of re-rolling it.
-    return res.status(200).json({ item, mode, request, card: effectiveCard, skill_type: effectiveSkillType, seed_card_names: seedCardNames, seed_cards: seedCards, problem_type: problemType })
+    // problemType via resolvePracticeRule above, instead of re-rolling it. reveal_translation tells
+    // the client (PracticeMcCloze.jsx) to show `item.translation` before the learner answers rather
+    // than only after — reusing `requireFrame` rather than a dedicated column, since a drill that
+    // forces the model to commit to a governing frame first (lib/languagePacks/germanSeed.js's
+    // production-which-preposition/conjunction rules) is, by construction, exactly a drill where
+    // several options can be independently natural and only differ in which meaning they produce.
+    return res.status(200).json({ item, mode, request, response, card: effectiveCard, skill_type: effectiveSkillType, seed_card_names: seedCardNames, seed_cards: seedCards, problem_type: problemType, reveal_translation: !!requireFrame })
   } catch (e) {
     await Promise.all([...checkLogs, ...usageLogs])
     if (e instanceof PracticeGenerationFailedError) {

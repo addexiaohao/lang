@@ -26,6 +26,73 @@ function fillBlank(sentence, option) {
   return sentence.replace('___', option)
 }
 
+// A single collapsed/expandable section — used to nest the conversation JSON (generation
+// request/response, each check's own request/response) instead of dumping it all as one flat
+// blob, since `conversation` is itself a JSON object containing a list of JSON check entries.
+function Collapsible({ label, defaultOpen = false, children }) {
+  const [open, setOpen] = useState(defaultOpen)
+  return (
+    <div className="border border-gray-200 rounded">
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="w-full flex items-center gap-1.5 px-2 py-1.5 text-left text-xs font-medium text-gray-600 hover:bg-gray-50 transition-colors"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"
+          className={`w-2.5 h-2.5 text-gray-400 shrink-0 transition-transform ${open ? 'rotate-90' : ''}`}>
+          <polyline points="9 18 15 12 9 6" />
+        </svg>
+        {label}
+      </button>
+      {open && <div className="border-t border-gray-200 p-2">{children}</div>}
+    </div>
+  )
+}
+
+function JsonBlock({ value }) {
+  return (
+    <pre className="text-sm text-gray-700 bg-gray-50 rounded p-2 overflow-x-auto max-h-[28rem] whitespace-pre-wrap">
+      {JSON.stringify(value ?? null, null, 2)}
+    </pre>
+  )
+}
+
+// `conversation` (lib/mcClozeCheckLog.js): { generation: { request, response }, checks: [{ option,
+// isAnswer, sentence, request, response, grammatical, sensible, reason }, ...] }. Rendered as
+// nested collapsibles rather than one JSON.stringify dump, so a specific request/response can be
+// opened without scrolling past every other one.
+function ConversationView({ conversation }) {
+  if (!conversation) return <p className="text-xs text-gray-400">No conversation recorded.</p>
+  const { generation, checks } = conversation
+  return (
+    <div className="space-y-2">
+      <Collapsible label="Generation">
+        <div className="space-y-2">
+          <Collapsible label="Request"><JsonBlock value={generation?.request} /></Collapsible>
+          <Collapsible label="Response"><JsonBlock value={generation?.response} /></Collapsible>
+        </div>
+      </Collapsible>
+      {Array.isArray(checks) && checks.length > 0 && (
+        <Collapsible label={`Checks (${checks.length})`}>
+          <div className="space-y-2">
+            {checks.map((c, i) => (
+              <Collapsible
+                key={i}
+                label={`${c.option}${c.isAnswer ? ' (answer)' : ''} — ${c.grammatical && c.sensible ? 'passed' : 'flagged'}`}
+              >
+                <div className="space-y-2">
+                  {c.reason && <p className="text-xs text-gray-600 italic">{c.reason}</p>}
+                  <Collapsible label="Request"><JsonBlock value={c.request} /></Collapsible>
+                  <Collapsible label="Response"><JsonBlock value={c.response} /></Collapsible>
+                </div>
+              </Collapsible>
+            ))}
+          </div>
+        </Collapsible>
+      )}
+    </div>
+  )
+}
+
 function FailureRow({ failure }) {
   const [showConversation, setShowConversation] = useState(false)
   // offending_sentences/reasons are parallel arrays (CLAUDE.md's "mc_cloze answer-uniqueness
@@ -82,12 +149,12 @@ function FailureRow({ failure }) {
         onClick={() => setShowConversation(v => !v)}
         className="text-[10px] text-blue-600 hover:text-blue-800 transition-colors"
       >
-        {showConversation ? 'Hide generation prompt' : 'Show generation prompt'}
+        {showConversation ? 'Hide full conversation' : 'Show full conversation'}
       </button>
       {showConversation && (
-        <pre className="mt-2 text-sm text-gray-700 bg-gray-50 border border-gray-200 rounded p-3 overflow-x-auto max-h-[32rem] whitespace-pre-wrap">
-          {JSON.stringify(failure.conversation ?? null, null, 2)}
-        </pre>
+        <div className="mt-2">
+          <ConversationView conversation={failure.conversation} />
+        </div>
       )}
     </div>
   )

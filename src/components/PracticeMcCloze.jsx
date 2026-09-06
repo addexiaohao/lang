@@ -6,8 +6,15 @@ import { speak } from '../tts.js'
 import { useProject } from '../ProjectContext.jsx'
 import { getProjectConfig } from '../../lib/projectConfig.js'
 
-// MC cloze exercise body. `item` is a practice.mc_cloze response: { sentence, options, answer, translation, option_meanings? }.
-// option_meanings (one English gloss per option, vocabulary cards only) is revealed exactly when the translation is.
+// MC cloze exercise body. `item` is a practice.mc_cloze response: { sentence, options, answer, translation, option_meanings?, revealTranslation? }.
+// option_meanings (one English gloss per option) is revealed exactly when the translation is (the
+// "See translation" toggle below) — unchanged for every item.
+//
+// revealTranslation items (production-which-preposition/conjunction — see PracticePanel.jsx) test
+// PRODUCING the right word for a stated meaning, so `translation` is ALSO always shown up front,
+// independent of the toggle — everything else (the toggle, option_meanings) behaves exactly as for
+// any other item, including showing the same translation a second time if "See translation" is
+// pressed.
 export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain, onAddSource, addSourceDisabled, onEasierSentence, easierCount = 0, maxEasierAttempts = 0, onAddNote }) {
   const { activeProject } = useProject()
   const { ttsLocale } = getProjectConfig(activeProject ?? {})
@@ -35,6 +42,9 @@ export default function PracticeMcCloze({ item, onWeiter, onAnswered, onExplain,
   return (
     <div className="flex flex-col h-full">
       <div className="flex-1 overflow-y-auto p-4">
+        {item.revealTranslation && (
+          <p className="mb-3 text-sm text-gray-600 italic">Meaning to produce: "{item.translation}"</p>
+        )}
         <p className="text-base leading-relaxed text-gray-800">
           <GermanText>{before}</GermanText>
           <span
